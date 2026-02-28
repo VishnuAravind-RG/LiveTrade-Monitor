@@ -1647,3 +1647,4 @@ if __name__ == '__main__':
     
     logger.info(f"ðŸš€ Quantum Trading Terminal starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=debug)
+# Final forced fix – no more global
