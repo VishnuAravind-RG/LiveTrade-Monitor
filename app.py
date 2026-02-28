@@ -66,7 +66,7 @@ TICKERS = {
     "SOL-USD": "SOL-USD",
 }
 
-# Global variable for CouchDB availability (must be declared before any function that modifies it)
+# Global variable for CouchDB availability
 COUCHDB_AVAILABLE = False
 
 # In-memory cache for news (to avoid too many requests)
@@ -269,15 +269,12 @@ def update_live_prices():
     """Update stock prices with REAL data"""
     global COUCHDB_AVAILABLE
     while True:
-        time.sleep(60)  # Update every minute
-        
+        time.sleep(60)
         try:
             if COUCHDB_AVAILABLE:
-                # Fetch all documents from CouchDB
                 resp = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
                 docs = [row['doc'] for row in resp.json().get('rows', []) if not row['id'].startswith('_design')]
             else:
-                # Use in-memory data
                 with memory_lock:
                     docs = list(memory_stock_data.values())
             
@@ -286,82 +283,58 @@ def update_live_prices():
                 symbol = doc.get('symbol', doc.get('ticker', ''))
                 if not symbol:
                     continue
-                
                 try:
-                    # Fetch REAL price from Yahoo Finance
                     stock = yf.Ticker(symbol)
                     hist = stock.history(period="1d", interval="5m")
-                    
                     if not hist.empty:
                         current_price = round(hist['Close'].iloc[-1], 2)
                         prev_close = doc.get('price', current_price)
-                        
-                        # Calculate change
                         change = round(current_price - prev_close, 2)
                         change_percent = round((change / prev_close) * 100, 2) if prev_close != 0 else 0
-                        
-                        # Get historical prices for indicators
                         hist_data = stock.history(period="1mo")
                         prices = hist_data['Close'].tolist() if not hist_data.empty else [current_price]
-                        
                         rsi = calculate_rsi(prices)
-                        
-                        # Trading signal based on RSI and price movement
                         if rsi < 30:
-                            signal = "BUY"  # Oversold
+                            signal = "BUY"
                         elif rsi > 70:
-                            signal = "SELL"  # Overbought
+                            signal = "SELL"
                         elif change_percent > 2:
-                            signal = "BUY"  # Strong upward movement
+                            signal = "BUY"
                         elif change_percent < -2:
-                            signal = "SELL"  # Strong downward movement
+                            signal = "SELL"
                         else:
                             signal = "HOLD"
-                        
                         doc['price'] = current_price
                         doc['change'] = change
                         doc['change_percent'] = change_percent
                         doc['signal'] = signal
                         doc['rsi'] = rsi
                         doc['last_updated'] = datetime.now().isoformat()
-                        
                     else:
-                        # Fallback to simulated data if API fails
                         old_price = doc.get('price', 1000.0)
                         jitter = random.uniform(-10.0, 10.0)
                         current_price = round(max(old_price + jitter, 0.1), 2)
-                        
                         change = round(current_price - old_price, 2)
                         change_percent = round((change / old_price) * 100, 2) if old_price != 0 else 0
-                        
-                        # Generate signal
                         if current_price > old_price * 1.01:
                             signal = "BUY"
                         elif current_price < old_price * 0.99:
                             signal = "SELL"
                         else:
                             signal = "HOLD"
-                            
                         doc['price'] = current_price
                         doc['change'] = change
                         doc['change_percent'] = change_percent
                         doc['signal'] = signal
                         doc['rsi'] = round(random.uniform(20, 80), 2)
                         doc['last_updated'] = datetime.now().isoformat()
-                        
                 except Exception as e:
                     logger.error(f"Error updating {symbol}: {e}")
-                    # Keep old data on error
-                    pass
-                    
                 updated_docs.append(doc)
-            
-            # Save updates
             if COUCHDB_AVAILABLE and updated_docs:
                 try:
                     requests.post(COUCHDB_URL + DB_NAME + "/_bulk_docs", json={"docs": updated_docs}, timeout=5)
                 except:
-                    logger.warning("Failed to update CouchDB, falling back to in-memory")
                     with memory_lock:
                         for doc in updated_docs:
                             memory_stock_data[doc['ticker']] = doc
@@ -369,7 +342,6 @@ def update_live_prices():
                 with memory_lock:
                     for doc in updated_docs:
                         memory_stock_data[doc['ticker']] = doc
-                    
         except Exception as e:
             logger.error(f"Price update error: {e}")
 
@@ -386,11 +358,8 @@ def add_stock():
     global COUCHDB_AVAILABLE
     data = request.json
     symbol = data.get('ticker', '').upper().strip()
-    
     if not symbol:
         return jsonify({"error": "Empty ticker"}), 400
-    
-    # Determine display name and exchange
     if ".NS" in symbol:
         display_name = symbol.replace('.NS', '')
         exchange = "NSE (India)"
@@ -400,18 +369,13 @@ def add_stock():
     else:
         display_name = symbol
         exchange = "NASDAQ (US)"
-    
     try:
-        # Fetch real stock data
         stock = yf.Ticker(symbol)
         hist = stock.history(period="1d")
-        
         if hist.empty:
-            # If market closed, suggest crypto or try with different format
             if symbol.endswith('.NS'):
                 return jsonify({"error": "NSE market closed. Try crypto (BTC-USD) or wait until Monday!"}), 400
             elif '-' not in symbol:
-                # Try with different format for crypto
                 crypto_symbol = symbol + "-USD"
                 crypto_stock = yf.Ticker(crypto_symbol)
                 crypto_hist = crypto_stock.history(period="1d")
@@ -421,22 +385,17 @@ def add_stock():
                     exchange = "Crypto"
                     hist = crypto_hist
                 else:
-                    return jsonify({"error": f"Market closed or invalid ticker. Try crypto like BTC-USD"}), 400
+                    return jsonify({"error": "Market closed or invalid ticker. Try crypto like BTC-USD"}), 400
             else:
                 return jsonify({"error": "Market closed or invalid ticker. Try crypto like BTC-USD"}), 400
-            
         price = round(hist['Close'].iloc[-1], 2)
         open_price = hist['Open'].iloc[-1] if not hist.empty else price
         change = round(price - open_price, 2)
         change_percent = round((change / open_price) * 100, 2) if open_price != 0 else 0
-        
-        # Get historical data for indicators
         hist_data = stock.history(period="1mo")
         prices = hist_data['Close'].tolist() if not hist_data.empty else [price]
         rsi = calculate_rsi(prices)
         moving_avgs = calculate_moving_averages(prices)
-        
-        # Create document
         new_doc = {
             "_id": display_name,
             "ticker": display_name,
@@ -452,35 +411,24 @@ def add_stock():
             "last_updated": datetime.now().isoformat(),
             "added_at": datetime.now().isoformat()
         }
-        
         if COUCHDB_AVAILABLE:
-            # Check if exists in CouchDB
             try:
                 check_resp = requests.get(COUCHDB_URL + DB_NAME + "/" + display_name)
                 if check_resp.status_code == 200:
                     new_doc['_rev'] = check_resp.json()['_rev']
-                
-                # Save to CouchDB
-                response = requests.put(
-                    COUCHDB_URL + DB_NAME + "/" + display_name,
-                    json=new_doc
-                )
-                
+                response = requests.put(COUCHDB_URL + DB_NAME + "/" + display_name, json=new_doc)
                 if response.status_code in [200, 201]:
                     return jsonify({"success": True, "price": price, "exchange": exchange})
                 else:
                     return jsonify({"error": "Failed to save to database"}), 500
             except:
-                # If CouchDB fails, fall back to in-memory
                 with memory_lock:
                     memory_stock_data[display_name] = new_doc
                 return jsonify({"success": True, "price": price, "exchange": exchange})
         else:
-            # Save to in-memory
             with memory_lock:
                 memory_stock_data[display_name] = new_doc
             return jsonify({"success": True, "price": price, "exchange": exchange})
-            
     except Exception as e:
         logger.error(f"Add stock error: {e}")
         return jsonify({"error": f"Failed to fetch stock data: {str(e)}"}), 500
@@ -492,36 +440,27 @@ def get_data():
     try:
         if COUCHDB_AVAILABLE:
             try:
-                # Get all documents from CouchDB
                 response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
                 data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
-                
-                # Get MapReduce total
                 try:
                     mr_response = requests.get(COUCHDB_URL + DB_NAME + "/_design/analytics/_view/portfolio_value", timeout=5)
                     mr_rows = mr_response.json().get('rows', [])
                     total_value = mr_rows[0]['value'] if mr_rows else 0.0
                 except:
                     total_value = sum(item.get('price', 0) for item in data)
-                
-                # Get signal distribution
                 signals = {}
                 for item in data:
                     signal = item.get('signal', 'HOLD')
                     signals[signal] = signals.get(signal, 0) + 1
-                    
-                # Get exchange distribution
                 exchanges = {}
                 for item in data:
                     exchange = item.get('exchange', 'Unknown')
                     exchanges[exchange] = exchanges.get(exchange, 0) + 1
             except:
-                # If CouchDB fails, fall back to in-memory
                 COUCHDB_AVAILABLE = False
                 with memory_lock:
                     data = list(memory_stock_data.values())
                     total_value = sum(item.get('price', 0) for item in data)
-                    
                     signals = {}
                     exchanges = {}
                     for item in data:
@@ -530,11 +469,9 @@ def get_data():
                         exchange = item.get('exchange', 'Unknown')
                         exchanges[exchange] = exchanges.get(exchange, 0) + 1
         else:
-            # Use in-memory data
             with memory_lock:
                 data = list(memory_stock_data.values())
                 total_value = sum(item.get('price', 0) for item in data)
-                
                 signals = {}
                 exchanges = {}
                 for item in data:
@@ -542,20 +479,15 @@ def get_data():
                     signals[signal] = signals.get(signal, 0) + 1
                     exchange = item.get('exchange', 'Unknown')
                     exchanges[exchange] = exchanges.get(exchange, 0) + 1
-        
-        # Format signal distribution for response
         signal_distribution = [{"key": k, "value": v} for k, v in signals.items()]
         exchange_distribution = [{"key": k, "value": v} for k, v in exchanges.items()]
-        
     except Exception as e:
         logger.error(f"Data fetch error: {e}")
-        # Fallback to in-memory if everything fails
         with memory_lock:
             data = list(memory_stock_data.values())
             total_value = sum(item.get('price', 0) for item in data)
             signal_distribution = []
             exchange_distribution = []
-    
     return jsonify({
         "server_id": socket.gethostname(),
         "environment": ENVIRONMENT,
@@ -825,7 +757,6 @@ def get_metrics():
 @app.route('/')
 def index():
     """Main dashboard with enhanced UI"""
-    # Your HTML code here (keep the same as before)
     html = '''<!DOCTYPE html>
     <html lang="en">
     <head>
