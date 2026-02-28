@@ -90,6 +90,7 @@ memory_lock = threading.Lock()
 
 def setup_db():
     """Initialize database (CouchDB or in-memory)"""
+    global COUCHDB_AVAILABLE
     if COUCHDB_AVAILABLE:
         try:
             # Create database if it doesn't exist
@@ -184,7 +185,7 @@ def setup_db():
             
         except Exception as e:
             logger.error(f"Database setup error: {e}")
-            global COUCHDB_AVAILABLE
+            
             COUCHDB_AVAILABLE = False
             initialize_memory_db()
     else:
