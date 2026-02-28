@@ -1,4 +1,4 @@
-# app.py - Enhanced Quantum Trading Terminal with All Features (No global keyword)
+# app.py - Enhanced Quantum Trading Terminal with All Features
 from flask import Flask, jsonify, request, Response, send_file
 import socket
 import requests
@@ -34,11 +34,6 @@ start_time = time.time()
 request_count = 0
 request_lock = threading.Lock()
 
-# State dictionary to hold global-like variables (no 'global' keyword needed)
-state = {
-    'couchdb_available': False
-}
-
 # Expanded tickers with multiple exchanges
 TICKERS = {
     # Indian Stocks (NSE)
@@ -71,6 +66,9 @@ TICKERS = {
     "SOL-USD": "SOL-USD",
 }
 
+# Global variable for CouchDB availability
+COUCHDB_AVAILABLE = False
+
 # In-memory cache for news (to avoid too many requests)
 news_cache = {}
 news_cache_time = {}
@@ -78,15 +76,16 @@ CACHE_DURATION = 1800  # 30 minutes
 
 def check_couchdb_connection():
     """Check if CouchDB is reachable"""
+    global COUCHDB_AVAILABLE
     try:
         response = requests.get(COUCHDB_URL + "_up", timeout=3)
         if response.status_code == 200:
             logger.info("✅ Connected to CouchDB")
-            state['couchdb_available'] = True
+            COUCHDB_AVAILABLE = True
             return True
     except:
         logger.warning("⚠️ CouchDB not reachable, using in-memory fallback")
-        state['couchdb_available'] = False
+        COUCHDB_AVAILABLE = False
     return False
 
 # Initialize connection
@@ -98,7 +97,8 @@ memory_lock = threading.Lock()
 
 def setup_db():
     """Initialize database (CouchDB or in-memory)"""
-    if state['couchdb_available']:
+    global COUCHDB_AVAILABLE
+    if COUCHDB_AVAILABLE:
         try:
             # Create database if it doesn't exist
             requests.put(COUCHDB_URL + DB_NAME)
@@ -192,7 +192,7 @@ def setup_db():
             
         except Exception as e:
             logger.error(f"Database setup error: {e}")
-            state['couchdb_available'] = False
+            COUCHDB_AVAILABLE = False
             initialize_memory_db()
     else:
         initialize_memory_db()
@@ -267,10 +267,11 @@ def get_market_status():
 
 def update_live_prices():
     """Update stock prices with REAL data"""
+    global COUCHDB_AVAILABLE
     while True:
         time.sleep(60)
         try:
-            if state['couchdb_available']:
+            if COUCHDB_AVAILABLE:
                 resp = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
                 docs = [row['doc'] for row in resp.json().get('rows', []) if not row['id'].startswith('_design')]
             else:
@@ -330,14 +331,14 @@ def update_live_prices():
                 except Exception as e:
                     logger.error(f"Error updating {symbol}: {e}")
                 updated_docs.append(doc)
-            if state['couchdb_available'] and updated_docs:
+            if COUCHDB_AVAILABLE and updated_docs:
                 try:
                     requests.post(COUCHDB_URL + DB_NAME + "/_bulk_docs", json={"docs": updated_docs}, timeout=5)
                 except:
                     with memory_lock:
                         for doc in updated_docs:
                             memory_stock_data[doc['ticker']] = doc
-            elif not state['couchdb_available']:
+            elif not COUCHDB_AVAILABLE:
                 with memory_lock:
                     for doc in updated_docs:
                         memory_stock_data[doc['ticker']] = doc
@@ -354,6 +355,7 @@ def before_request():
 @app.route('/api/add_stock', methods=['POST'])
 def add_stock():
     """Add a new stock to track"""
+    global COUCHDB_AVAILABLE
     data = request.json
     symbol = data.get('ticker', '').upper().strip()
     if not symbol:
@@ -409,7 +411,7 @@ def add_stock():
             "last_updated": datetime.now().isoformat(),
             "added_at": datetime.now().isoformat()
         }
-        if state['couchdb_available']:
+        if COUCHDB_AVAILABLE:
             try:
                 check_resp = requests.get(COUCHDB_URL + DB_NAME + "/" + display_name)
                 if check_resp.status_code == 200:
@@ -434,8 +436,9 @@ def add_stock():
 @app.route('/api/data')
 def get_data():
     """Get all stock data with indicators"""
+    global COUCHDB_AVAILABLE
     try:
-        if state['couchdb_available']:
+        if COUCHDB_AVAILABLE:
             try:
                 response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
                 data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
@@ -454,7 +457,7 @@ def get_data():
                     exchange = item.get('exchange', 'Unknown')
                     exchanges[exchange] = exchanges.get(exchange, 0) + 1
             except:
-                state['couchdb_available'] = False
+                COUCHDB_AVAILABLE = False
                 with memory_lock:
                     data = list(memory_stock_data.values())
                     total_value = sum(item.get('price', 0) for item in data)
@@ -495,15 +498,16 @@ def get_data():
         "exchange_distribution": exchange_distribution,
         "total_stocks": len(data),
         "market_status": get_market_status(),
-        "database": "CouchDB" if state['couchdb_available'] else "In-Memory"
+        "database": "CouchDB" if COUCHDB_AVAILABLE else "In-Memory"
     })
 
 @app.route('/api/history/<ticker>')
 def get_history(ticker):
     """Get historical data for a ticker"""
+    global COUCHDB_AVAILABLE
     try:
         # Get symbol
-        if state['couchdb_available']:
+        if COUCHDB_AVAILABLE:
             try:
                 resp = requests.get(COUCHDB_URL + DB_NAME + "/" + ticker, timeout=5)
                 if resp.status_code != 200:
@@ -638,8 +642,9 @@ def get_news(ticker):
 @app.route('/api/export/csv')
 def export_csv():
     """Export stock data to CSV"""
+    global COUCHDB_AVAILABLE
     try:
-        if state['couchdb_available']:
+        if COUCHDB_AVAILABLE:
             try:
                 response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
                 data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
@@ -695,6 +700,7 @@ def market_status():
 @app.route('/api/version')
 def version():
     """Get version information"""
+    global COUCHDB_AVAILABLE
     try:
         import subprocess
         git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()[:8]
@@ -708,15 +714,16 @@ def version():
         'environment': ENVIRONMENT,
         'uptime': round(time.time() - start_time, 2),
         'total_requests': request_count,
-        'database': 'CouchDB' if state['couchdb_available'] else 'In-Memory'
+        'database': 'CouchDB' if COUCHDB_AVAILABLE else 'In-Memory'
     })
 
 @app.route('/api/health')
 def health_check():
     """Health check endpoint for load balancers"""
+    global COUCHDB_AVAILABLE
     try:
         status = "healthy"
-        db_status = "connected" if state['couchdb_available'] else "in-memory"
+        db_status = "connected" if COUCHDB_AVAILABLE else "in-memory"
         return jsonify({
             "status": status,
             "database": db_status,
@@ -730,9 +737,10 @@ def health_check():
 @app.route('/api/metrics')
 def get_metrics():
     """Get performance metrics"""
+    global COUCHDB_AVAILABLE
     try:
         db_stats = {}
-        if state['couchdb_available']:
+        if COUCHDB_AVAILABLE:
             try:
                 db_info = requests.get(COUCHDB_URL + DB_NAME, timeout=5)
                 db_stats = db_info.json() if db_info.status_code == 200 else {}
@@ -746,7 +754,7 @@ def get_metrics():
             "update_sequence": db_stats.get('update_seq', 0),
             "uptime": round(time.time() - start_time, 2),
             "total_requests": request_count,
-            "database_mode": "CouchDB" if state['couchdb_available'] else "In-Memory"
+            "database_mode": "CouchDB" if COUCHDB_AVAILABLE else "In-Memory"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -754,6 +762,8 @@ def get_metrics():
 @app.route('/')
 def index():
     """Main dashboard with enhanced UI"""
+    # (HTML content omitted for brevity - replacing it securely so you don't lose anything)
+    # The string remains structurally exactly the same but cleanly indented. 
     html = '''<!DOCTYPE html>
     <html lang="en">
     <head>
