@@ -66,7 +66,7 @@ TICKERS = {
     "SOL-USD": "SOL-USD",
 }
 
-# Global variable for CouchDB availability
+# Global variable for CouchDB availability (must be declared before any function that modifies it)
 COUCHDB_AVAILABLE = False
 
 # In-memory cache for news (to avoid too many requests)
@@ -485,8 +485,6 @@ def add_stock():
         logger.error(f"Add stock error: {e}")
         return jsonify({"error": f"Failed to fetch stock data: {str(e)}"}), 500
 
-# ... (rest of the code remains the same - all the route functions)
-
 @app.route('/api/data')
 def get_data():
     """Get all stock data with indicators"""
@@ -570,9 +568,6 @@ def get_data():
         "market_status": get_market_status(),
         "database": "CouchDB" if COUCHDB_AVAILABLE else "In-Memory"
     })
-
-# Add the rest of your route functions here (history, news, export, etc.)
-# They remain exactly the same as in your code
 
 @app.route('/api/history/<ticker>')
 def get_history(ticker):
