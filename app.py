@@ -66,6 +66,9 @@ TICKERS = {
     "SOL-USD": "SOL-USD",
 }
 
+# Global variable for CouchDB availability
+COUCHDB_AVAILABLE = False
+
 # In-memory cache for news (to avoid too many requests)
 news_cache = {}
 news_cache_time = {}
@@ -73,16 +76,20 @@ CACHE_DURATION = 1800  # 30 minutes
 
 def check_couchdb_connection():
     """Check if CouchDB is reachable"""
+    global COUCHDB_AVAILABLE
     try:
         response = requests.get(COUCHDB_URL + "_up", timeout=3)
         if response.status_code == 200:
             logger.info("✅ Connected to CouchDB")
+            COUCHDB_AVAILABLE = True
             return True
     except:
         logger.warning("⚠️ CouchDB not reachable, using in-memory fallback")
+        COUCHDB_AVAILABLE = False
     return False
 
-COUCHDB_AVAILABLE = check_couchdb_connection()
+# Initialize connection
+check_couchdb_connection()
 
 # In-memory fallback storage
 memory_stock_data = {}
@@ -185,7 +192,6 @@ def setup_db():
             
         except Exception as e:
             logger.error(f"Database setup error: {e}")
-            
             COUCHDB_AVAILABLE = False
             initialize_memory_db()
     else:
@@ -261,6 +267,7 @@ def get_market_status():
 
 def update_live_prices():
     """Update stock prices with REAL data"""
+    global COUCHDB_AVAILABLE
     while True:
         time.sleep(60)  # Update every minute
         
@@ -376,6 +383,7 @@ def before_request():
 @app.route('/api/add_stock', methods=['POST'])
 def add_stock():
     """Add a new stock to track"""
+    global COUCHDB_AVAILABLE
     data = request.json
     symbol = data.get('ticker', '').upper().strip()
     
@@ -402,7 +410,7 @@ def add_stock():
             # If market closed, suggest crypto or try with different format
             if symbol.endswith('.NS'):
                 return jsonify({"error": "NSE market closed. Try crypto (BTC-USD) or wait until Monday!"}), 400
-            elif not '-' in symbol:
+            elif '-' not in symbol:
                 # Try with different format for crypto
                 crypto_symbol = symbol + "-USD"
                 crypto_stock = yf.Ticker(crypto_symbol)
@@ -447,20 +455,26 @@ def add_stock():
         
         if COUCHDB_AVAILABLE:
             # Check if exists in CouchDB
-            check_resp = requests.get(COUCHDB_URL + DB_NAME + "/" + display_name)
-            if check_resp.status_code == 200:
-                new_doc['_rev'] = check_resp.json()['_rev']
+            try:
+                check_resp = requests.get(COUCHDB_URL + DB_NAME + "/" + display_name)
+                if check_resp.status_code == 200:
+                    new_doc['_rev'] = check_resp.json()['_rev']
                 
-            # Save to CouchDB
-            response = requests.put(
-                COUCHDB_URL + DB_NAME + "/" + display_name,
-                json=new_doc
-            )
-            
-            if response.status_code in [200, 201]:
+                # Save to CouchDB
+                response = requests.put(
+                    COUCHDB_URL + DB_NAME + "/" + display_name,
+                    json=new_doc
+                )
+                
+                if response.status_code in [200, 201]:
+                    return jsonify({"success": True, "price": price, "exchange": exchange})
+                else:
+                    return jsonify({"error": "Failed to save to database"}), 500
+            except:
+                # If CouchDB fails, fall back to in-memory
+                with memory_lock:
+                    memory_stock_data[display_name] = new_doc
                 return jsonify({"success": True, "price": price, "exchange": exchange})
-            else:
-                return jsonify({"error": "Failed to save to database"}), 500
         else:
             # Save to in-memory
             with memory_lock:
@@ -471,34 +485,52 @@ def add_stock():
         logger.error(f"Add stock error: {e}")
         return jsonify({"error": f"Failed to fetch stock data: {str(e)}"}), 500
 
+# ... (rest of the code remains the same - all the route functions)
+
 @app.route('/api/data')
 def get_data():
     """Get all stock data with indicators"""
+    global COUCHDB_AVAILABLE
     try:
         if COUCHDB_AVAILABLE:
-            # Get all documents from CouchDB
-            response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
-            data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
-            
-            # Get MapReduce total
             try:
-                mr_response = requests.get(COUCHDB_URL + DB_NAME + "/_design/analytics/_view/portfolio_value", timeout=5)
-                mr_rows = mr_response.json().get('rows', [])
-                total_value = mr_rows[0]['value'] if mr_rows else 0.0
-            except:
-                total_value = sum(item.get('price', 0) for item in data)
-            
-            # Get signal distribution
-            signals = {}
-            for item in data:
-                signal = item.get('signal', 'HOLD')
-                signals[signal] = signals.get(signal, 0) + 1
+                # Get all documents from CouchDB
+                response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
+                data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
                 
-            # Get exchange distribution
-            exchanges = {}
-            for item in data:
-                exchange = item.get('exchange', 'Unknown')
-                exchanges[exchange] = exchanges.get(exchange, 0) + 1
+                # Get MapReduce total
+                try:
+                    mr_response = requests.get(COUCHDB_URL + DB_NAME + "/_design/analytics/_view/portfolio_value", timeout=5)
+                    mr_rows = mr_response.json().get('rows', [])
+                    total_value = mr_rows[0]['value'] if mr_rows else 0.0
+                except:
+                    total_value = sum(item.get('price', 0) for item in data)
+                
+                # Get signal distribution
+                signals = {}
+                for item in data:
+                    signal = item.get('signal', 'HOLD')
+                    signals[signal] = signals.get(signal, 0) + 1
+                    
+                # Get exchange distribution
+                exchanges = {}
+                for item in data:
+                    exchange = item.get('exchange', 'Unknown')
+                    exchanges[exchange] = exchanges.get(exchange, 0) + 1
+            except:
+                # If CouchDB fails, fall back to in-memory
+                COUCHDB_AVAILABLE = False
+                with memory_lock:
+                    data = list(memory_stock_data.values())
+                    total_value = sum(item.get('price', 0) for item in data)
+                    
+                    signals = {}
+                    exchanges = {}
+                    for item in data:
+                        signal = item.get('signal', 'HOLD')
+                        signals[signal] = signals.get(signal, 0) + 1
+                        exchange = item.get('exchange', 'Unknown')
+                        exchanges[exchange] = exchanges.get(exchange, 0) + 1
         else:
             # Use in-memory data
             with memory_lock:
@@ -519,7 +551,7 @@ def get_data():
         
     except Exception as e:
         logger.error(f"Data fetch error: {e}")
-        # Fallback to in-memory if CouchDB fails
+        # Fallback to in-memory if everything fails
         with memory_lock:
             data = list(memory_stock_data.values())
             total_value = sum(item.get('price', 0) for item in data)
@@ -539,17 +571,26 @@ def get_data():
         "database": "CouchDB" if COUCHDB_AVAILABLE else "In-Memory"
     })
 
+# Add the rest of your route functions here (history, news, export, etc.)
+# They remain exactly the same as in your code
+
 @app.route('/api/history/<ticker>')
 def get_history(ticker):
     """Get historical data for a ticker"""
     try:
         # Get symbol
         if COUCHDB_AVAILABLE:
-            resp = requests.get(COUCHDB_URL + DB_NAME + "/" + ticker, timeout=5)
-            if resp.status_code != 200:
-                return jsonify({"error": "Ticker not found"}), 404
-            doc = resp.json()
-            symbol = doc.get('symbol', ticker)
+            try:
+                resp = requests.get(COUCHDB_URL + DB_NAME + "/" + ticker, timeout=5)
+                if resp.status_code != 200:
+                    return jsonify({"error": "Ticker not found"}), 404
+                doc = resp.json()
+                symbol = doc.get('symbol', ticker)
+            except:
+                with memory_lock:
+                    if ticker not in memory_stock_data:
+                        return jsonify({"error": "Ticker not found"}), 404
+                    symbol = memory_stock_data[ticker].get('symbol', ticker)
         else:
             with memory_lock:
                 if ticker not in memory_stock_data:
@@ -675,8 +716,12 @@ def export_csv():
     """Export stock data to CSV"""
     try:
         if COUCHDB_AVAILABLE:
-            response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
-            data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
+            try:
+                response = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=5)
+                data = [row['doc'] for row in response.json().get('rows', []) if not row['id'].startswith('_design')]
+            except:
+                with memory_lock:
+                    data = list(memory_stock_data.values())
         else:
             with memory_lock:
                 data = list(memory_stock_data.values())
@@ -785,6 +830,7 @@ def get_metrics():
 @app.route('/')
 def index():
     """Main dashboard with enhanced UI"""
+    # Your HTML code here (keep the same as before)
     html = '''<!DOCTYPE html>
     <html lang="en">
     <head>
