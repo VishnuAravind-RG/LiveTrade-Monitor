@@ -1,4 +1,4 @@
-# app.py (Enhanced version with cloud features)
+# app.py (Fixed version - No AWS dependencies)
 from flask import Flask, jsonify, request
 import socket
 import requests
@@ -9,9 +9,6 @@ import random
 import os
 import logging
 from datetime import datetime
-import boto3
-from botocore.exceptions import ClientError
-import json
 
 app = Flask(__name__)
 
@@ -22,16 +19,7 @@ logger = logging.getLogger(__name__)
 # Configuration from environment variables
 COUCHDB_URL = os.getenv('COUCHDB_URL', "http://admin:password@couchdb:5984/")
 DB_NAME = os.getenv('DB_NAME', "stocks")
-AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'development')
-
-# Initialize AWS clients if in cloud
-if ENVIRONMENT != 'development':
-    cloudwatch = boto3.client('cloudwatch', region_name=AWS_REGION)
-    dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-else:
-    cloudwatch = None
-    dynamodb = None
 
 TICKERS = {
     "RELIANCE": "RELIANCE.NS",
@@ -142,47 +130,9 @@ def update_live_prices():
                     COUCHDB_URL + DB_NAME + "/_bulk_docs",
                     json={"docs": updated_docs}
                 )
-                
-                # Send metrics to CloudWatch if in cloud
-                if cloudwatch:
-                    send_metrics_to_cloudwatch(updated_docs)
                     
         except Exception as e:
             logger.error(f"Price update error: {e}")
-
-def send_metrics_to_cloudwatch(stocks):
-    """Send metrics to AWS CloudWatch"""
-    try:
-        for stock in stocks:
-            cloudwatch.put_metric_data(
-                Namespace='QuantumTrading',
-                MetricData=[
-                    {
-                        'MetricName': 'StockPrice',
-                        'Dimensions': [
-                            {
-                                'Name': 'Ticker',
-                                'Value': stock['ticker']
-                            }
-                        ],
-                        'Value': stock['price'],
-                        'Unit': 'Count'
-                    },
-                    {
-                        'MetricName': 'TradingSignal',
-                        'Dimensions': [
-                            {
-                                'Name': 'Ticker',
-                                'Value': stock['ticker']
-                            }
-                        ],
-                        'Value': 1 if stock['signal'] == 'BUY' else 0 if stock['signal'] == 'SELL' else 0.5,
-                        'Unit': 'Count'
-                    }
-                ]
-            )
-    except Exception as e:
-        logger.error(f"CloudWatch metrics error: {e}")
 
 @app.route('/api/add_stock', methods=['POST'])
 def add_stock():
@@ -227,16 +177,6 @@ def add_stock():
         )
         
         if response.status_code in [200, 201]:
-            # Log to DynamoDB if in cloud
-            if dynamodb:
-                table = dynamodb.Table('StockAdditions')
-                table.put_item(Item={
-                    'ticker': display_name,
-                    'timestamp': datetime.now().isoformat(),
-                    'price': price,
-                    'symbol': symbol
-                })
-            
             return jsonify({"success": True, "price": price})
         else:
             return jsonify({"error": "Failed to save to database"}), 500
@@ -316,9 +256,8 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Quantum Trading Terminal - Cloud Edition</title>
+        <title>Quantum Trading Terminal</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
         <style>
             @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Rajdhani:wght@500;700&display=swap');
             
@@ -357,13 +296,45 @@ def index():
                 text-shadow: 0 0 10px rgba(0,242,254,0.5);
             }
             
-            .badge-cloud {
-                background: linear-gradient(90deg, #ff6b6b, #4ecdc4);
-                padding: 5px 15px;
-                border-radius: 20px;
+            .controls {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            
+            select {
+                background: rgba(0,0,0,0.5);
+                border: 1px solid var(--neon-purple);
                 color: white;
-                font-size: 0.9rem;
+                padding: 8px 15px;
+                border-radius: 4px;
+                font-family: monospace;
+                outline: none;
+                cursor: pointer;
+            }
+            
+            select:focus {
+                box-shadow: 0 0 10px rgba(176,38,255,0.4);
+            }
+            
+            select option {
+                background: var(--bg-deep);
+                color: white;
+            }
+            
+            button {
+                background: linear-gradient(90deg, var(--neon-purple), var(--neon-blue));
+                border: none;
+                color: white;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-family: 'Orbitron', sans-serif;
                 font-weight: bold;
+                cursor: pointer;
+            }
+            
+            button:hover {
+                box-shadow: 0 0 15px rgba(0,242,254,0.6);
             }
             
             .server-badge {
@@ -508,34 +479,23 @@ def index():
                 font-family: monospace;
                 font-size: 1.2rem;
             }
-            
-            .cloud-status {
-                display: flex;
-                gap: 10px;
-                align-items: center;
-            }
-            
-            .status-indicator {
-                width: 10px;
-                height: 10px;
-                border-radius: 50%;
-                background-color: #00ff87;
-                animation: pulse 2s infinite;
-            }
-            
-            @keyframes pulse {
-                0% { box-shadow: 0 0 0 0 rgba(0, 255, 135, 0.7); }
-                70% { box-shadow: 0 0 0 10px rgba(0, 255, 135, 0); }
-                100% { box-shadow: 0 0 0 0 rgba(0, 255, 135, 0); }
-            }
         </style>
     </head>
     <body>
         <div class="top-bar">
             <h1>QUANTUM TRADING TERMINAL</h1>
-            <div class="cloud-status">
-                <span class="badge-cloud">☁️ AWS CLOUD</span>
-                <span class="status-indicator"></span>
+            <div class="controls">
+                <select id="ticker-input">
+                    <option value="ZOMATO.NS">ZOMATO</option>
+                    <option value="WIPRO.NS">WIPRO</option>
+                    <option value="TATAMOTORS.NS">TATA MOTORS</option>
+                    <option value="SBIN.NS">SBI</option>
+                    <option value="INFY.NS">INFOSYS</option>
+                    <option value="ITC.NS">ITC</option>
+                    <option value="BHARTIARTL.NS">AIRTEL</option>
+                    <option value="MRF.NS">MRF</option>
+                </select>
+                <button onclick="addStock()" id="add-btn">ADD ASSET</button>
             </div>
             <div class="server-badge">
                 Instance: <span id="server-id">CONNECTING...</span>
@@ -556,8 +516,8 @@ def index():
                 <div class="kpi-value c-purple" id="kpi-assets">0</div>
             </div>
             <div class="kpi-card">
-                <div class="kpi-title">Cloud Metrics</div>
-                <div class="kpi-value" id="kpi-cloud">ACTIVE</div>
+                <div class="kpi-title">Live Status</div>
+                <div class="kpi-value c-green" id="kpi-status">ACTIVE</div>
             </div>
         </div>
 
@@ -596,180 +556,174 @@ def index():
         </div>
 
         <script>
-            const chartOptions = {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: { duration: 500 },
-                plugins: {
-                    legend: { labels: { color: '#e2e8f0' } }
+        function addStock() {
+            const ticker = document.getElementById('ticker-input').value;
+            const btn = document.getElementById('add-btn');
+            
+            btn.innerText = "FETCHING...";
+            fetch('/api/add_stock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ticker: ticker })
+            })
+            .then(r => r.json())
+            .then(d => {
+                btn.innerText = "ADD ASSET";
+                if(d.error) alert("Error: " + d.error);
+                else {
+                    fetchData();
                 }
-            };
-
-            // Initialize charts
-            const ctxCombo = document.getElementById('comboChart').getContext('2d');
-            const comboChart = new Chart(ctxCombo, {
-                type: 'line',
-                data: {
-                    labels: [],
-                    datasets: [{
-                        label: 'Portfolio Value',
-                        data: [],
-                        borderColor: '#00ff87',
-                        backgroundColor: 'rgba(0, 255, 135, 0.1)',
-                        tension: 0.4,
-                        fill: true
-                    }]
-                },
-                options: {
-                    ...chartOptions,
-                    scales: {
-                        x: { grid: { color: 'rgba(255,255,255,0.05)' } },
-                        y: { grid: { color: 'rgba(255,255,255,0.05)' } }
-                    }
-                }
+            })
+            .catch(e => {
+                btn.innerText = "ADD ASSET";
+                alert("Network error.");
             });
+        }
 
-            const ctxPolar = document.getElementById('polarChart').getContext('2d');
-            const polarChart = new Chart(ctxPolar, {
-                type: 'polarArea',
-                data: {
-                    labels: [],
-                    datasets: [{
-                        data: [],
-                        backgroundColor: [
-                            'rgba(0,242,254,0.6)',
-                            'rgba(0,255,135,0.6)',
-                            'rgba(176,38,255,0.6)',
-                            'rgba(255,153,0,0.6)',
-                            'rgba(255,51,102,0.6)'
-                        ]
-                    }]
-                },
-                options: chartOptions
-            });
-
-            const ctxBar = document.getElementById('barChart').getContext('2d');
-            const barChart = new Chart(ctxBar, {
-                type: 'bar',
-                data: {
-                    labels: [],
-                    datasets: [{
-                        label: 'Price (₹)',
-                        data: [],
-                        backgroundColor: '#00f2fe'
-                    }]
-                },
-                options: {
-                    ...chartOptions,
-                    plugins: { legend: { display: false } }
-                }
-            });
-
-            const ctxDonut = document.getElementById('donutChart').getContext('2d');
-            const donutChart = new Chart(ctxDonut, {
-                type: 'doughnut',
-                data: {
-                    labels: ['BUY', 'SELL', 'HOLD'],
-                    datasets: [{
-                        data: [0, 0, 0],
-                        backgroundColor: ['#00ff87', '#ff3366', '#64748b']
-                    }]
-                },
-                options: {
-                    ...chartOptions,
-                    cutout: '70%'
-                }
-            });
-
-            // Fetch data function
-            function fetchData() {
-                fetch('/api/data')
-                    .then(response => response.json())
-                    .then(data => {
-                        // Update server info
-                        document.getElementById('server-id').textContent = data.server_id;
-                        
-                        // Update KPI
-                        document.getElementById('kpi-total').textContent = 
-                            '₹' + data.mapreduce_total.toLocaleString('en-IN');
-                        document.getElementById('kpi-assets').textContent = data.stock_data.length;
-                        
-                        // Update charts
-                        updateCharts(data);
-                        
-                        // Update progress bars
-                        updateProgressBars(data);
-                    })
-                    .catch(error => {
-                        console.error('Error fetching data:', error);
-                    });
+        const chartOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 500 },
+            plugins: {
+                legend: { labels: { color: '#e2e8f0' } }
             }
+        };
 
-            function updateCharts(data) {
-                // Update combo chart
-                if (data.stock_data.length > 0) {
-                    const avgPrice = data.stock_data.reduce((sum, s) => sum + s.price, 0) / data.stock_data.length;
-                    
-                    comboChart.data.labels.push(new Date().toLocaleTimeString());
-                    comboChart.data.datasets[0].data.push(avgPrice);
-                    
-                    if (comboChart.data.labels.length > 20) {
-                        comboChart.data.labels.shift();
-                        comboChart.data.datasets[0].data.shift();
-                    }
-                    comboChart.update();
+        // Initialize charts
+        const ctxCombo = document.getElementById('comboChart').getContext('2d');
+        const comboChart = new Chart(ctxCombo, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Average Price',
+                    data: [],
+                    borderColor: '#00ff87',
+                    backgroundColor: 'rgba(0, 255, 135, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    x: { grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' } }
+                }
+            }
+        });
+
+        const ctxPolar = document.getElementById('polarChart').getContext('2d');
+        const polarChart = new Chart(ctxPolar, {
+            type: 'polarArea',
+            data: {
+                labels: [],
+                datasets: [{
+                    data: [],
+                    backgroundColor: [
+                        'rgba(0,242,254,0.6)',
+                        'rgba(0,255,135,0.6)',
+                        'rgba(176,38,255,0.6)',
+                        'rgba(255,153,0,0.6)',
+                        'rgba(255,51,102,0.6)'
+                    ]
+                }]
+            },
+            options: chartOptions
+        });
+
+        const ctxBar = document.getElementById('barChart').getContext('2d');
+        const barChart = new Chart(ctxBar, {
+            type: 'bar',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Price (₹)',
+                    data: [],
+                    backgroundColor: '#00f2fe'
+                }]
+            },
+            options: {
+                ...chartOptions,
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        const ctxDonut = document.getElementById('donutChart').getContext('2d');
+        const donutChart = new Chart(ctxDonut, {
+            type: 'doughnut',
+            data: {
+                labels: ['BUY', 'SELL', 'HOLD'],
+                datasets: [{
+                    data: [0, 0, 0],
+                    backgroundColor: ['#00ff87', '#ff3366', '#64748b']
+                }]
+            },
+            options: {
+                ...chartOptions,
+                cutout: '70%'
+            }
+        });
+
+        function fetchData() {
+            fetch('/api/data')
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById('server-id').innerText = d.server_id;
+                document.getElementById('kpi-total').innerText = '₹' + d.mapreduce_total.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                document.getElementById('kpi-assets').innerText = d.stock_data.length;
+                
+                let buys = 0, sells = 0, holds = 0;
+                let tickers = [], prices = [];
+
+                if(d.stock_data.length > 0) {
+                    d.stock_data.forEach(s => {
+                        tickers.push(s.ticker);
+                        prices.push(s.price);
+                        if(s.signal === 'BUY') buys++;
+                        else if(s.signal === 'SELL') sells++;
+                        else holds++;
+                    });
                 }
 
-                // Update polar chart
-                polarChart.data.labels = data.stock_data.map(s => s.ticker);
-                polarChart.data.datasets[0].data = data.stock_data.map(s => s.price);
+                // Update charts
+                comboChart.data.labels.push(new Date().toLocaleTimeString());
+                comboChart.data.datasets[0].data.push(d.mapreduce_total);
+                if (comboChart.data.labels.length > 15) {
+                    comboChart.data.labels.shift();
+                    comboChart.data.datasets[0].data.shift();
+                }
+                comboChart.update();
+
+                polarChart.data.labels = tickers;
+                polarChart.data.datasets[0].data = prices;
                 polarChart.update();
 
-                // Update bar chart
-                barChart.data.labels = data.stock_data.map(s => s.ticker);
-                barChart.data.datasets[0].data = data.stock_data.map(s => s.price);
+                barChart.data.labels = tickers;
+                barChart.data.datasets[0].data = prices;
                 barChart.update();
 
-                // Update donut chart
-                const signals = data.stock_data.reduce((acc, s) => {
-                    acc[s.signal] = (acc[s.signal] || 0) + 1;
-                    return acc;
-                }, {});
-                
-                donutChart.data.datasets[0].data = [
-                    signals['BUY'] || 0,
-                    signals['SELL'] || 0,
-                    signals['HOLD'] || 0
-                ];
+                donutChart.data.datasets[0].data = [buys, sells, holds];
                 donutChart.update();
-            }
 
-            function updateProgressBars(data) {
-                const container = document.getElementById('progress-box');
-                container.innerHTML = '';
-                
-                data.stock_data.forEach(stock => {
-                    const percentage = (stock.price / data.mapreduce_total * 100).toFixed(1);
-                    
-                    const row = document.createElement('div');
-                    row.className = 'prog-row';
-                    row.innerHTML = `
-                        <span style="width: 70px;">${stock.ticker}</span>
-                        <div class="prog-bar-bg">
-                            <div class="prog-bar-fill" style="width: ${percentage}%"></div>
+                // Update progress bars
+                const progBox = document.getElementById('progress-box');
+                progBox.innerHTML = '';
+                d.stock_data.forEach(s => {
+                    let weight = d.mapreduce_total > 0 ? Math.round((s.price / d.mapreduce_total) * 100) : 0;
+                    progBox.innerHTML += `
+                        <div class="prog-row">
+                            <span style="width: 70px; color: #94a3b8; font-size: 0.9rem;">${s.ticker}</span>
+                            <div class="prog-bar-bg"><div class="prog-bar-fill" style="width: ${weight}%"></div></div>
+                            <span class="prog-pct">${weight}%</span>
                         </div>
-                        <span class="prog-pct">${percentage}%</span>
                     `;
-                    
-                    container.appendChild(row);
                 });
-            }
+            });
+        }
 
-            // Fetch data every 2 seconds
-            setInterval(fetchData, 2000);
-            
-            // Initial fetch
-            fetchData();
+        setInterval(fetchData, 2000);
+        fetchData();
         </script>
     </body>
     </html>'''
