@@ -16,6 +16,7 @@ import io
 import csv
 import feedparser
 import urllib.parse
+import pytz
 
 app = Flask(__name__)
 
@@ -223,14 +224,28 @@ def calculate_moving_averages(prices):
     }
 
 def get_market_status():
-    now = datetime.now()
+    """Check if market is open using IST timezone"""
+    # Get current time in IST (India time)
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    # Check if weekend (Saturday or Sunday)
     if now.weekday() >= 5:
         return "Closed (Weekend)"
+    
+    # Check NSE trading hours (9:15 AM to 3:30 PM IST)
     hour = now.hour
     minute = now.minute
-    if hour < 9 or (hour == 9 and minute < 15) or hour > 15 or (hour == 15 and minute > 30):
+    
+    # Convert time to minutes for easier comparison
+    current_minutes = hour * 60 + minute
+    market_open = 9 * 60 + 15  # 9:15 AM
+    market_close = 15 * 60 + 30  # 3:30 PM
+    
+    if market_open <= current_minutes <= market_close:
+        return "Open"
+    else:
         return "Closed"
-    return "Open"
 
 def update_live_prices():
     while True:
