@@ -1,6 +1,6 @@
-# TEMPORARY: Force Redis off to test web app startup
-import os
-os.environ['REDIS_URL'] = 'redis://localhost:6379'  # Override any Railway URL
+import sys
+print("APP STARTUP: Python imports beginning...", flush=True, file=sys.stderr)
+
 from flask import Flask, jsonify, request, Response, redirect, url_for, render_template_string
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,25 +12,28 @@ import random
 import os
 import logging
 from datetime import datetime, timedelta
-import io
 import csv
+import io
 import feedparser
 import urllib.parse
 import pytz
 import json
 import redis
 import yfinance as yf
-from ml_model import predict_next_day
 
-print("🚀 Starting app.py initialization...")
-print("✅ Imports done")
-print("🚀 Starting core initialization...")
+# NOTE: ml_model is NOT imported here at the top level.
+# It is imported lazily inside the /api/predict route to prevent
+# TensorFlow/CUDA crashes from killing the entire app on startup.
+
+print("APP STARTUP: All standard imports done.", flush=True, file=sys.stderr)
 
 app = Flask(__name__)
-app.secret_key = "PSG_TECH_SECRET_KEY"
+app.secret_key = os.getenv("SECRET_KEY", "PSG_TECH_SECRET_KEY_CHANGE_IN_PROD")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+print("APP STARTUP: Flask app created.", flush=True, file=sys.stderr)
 
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -39,41 +42,49 @@ login_manager.login_view = 'login_page'  # type: ignore
 COUCHDB_URL = os.getenv("COUCHDB_URL", "http://admin:password@couchdb:5984/")
 DB_NAME = "stocks"
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL", "")
 
-# ==========================================
-# REDIS CONNECTION – FULLY OPTIONAL
-# ==========================================
 redis_client = None
 local_cache = []
 cache_lock = threading.Lock()
 
-print("⏳ Connecting to Redis...")
-try:
-    redis_client = redis.Redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_connect_timeout=2,
-        socket_timeout=2,
-        retry_on_timeout=False,
-        health_check_interval=30
-    )
-    # Test connection quickly
-    if redis_client.ping():
-        print("✅ Redis connected")
-    else:
-        redis_client = None
-        print("⚠️ Redis ping failed")
-except Exception as e:
-    print(f"⚠️ Redis unavailable (will run without live updates): {e}")
-    redis_client = None
 
-# Background subscriber thread – runs only if Redis is available
+def _init_redis():
+    """Try to connect to Redis. Returns client or None. Never raises."""
+    global redis_client
+    if not REDIS_URL:
+        logger.warning("REDIS_URL not set — running without live market feed.")
+        return None
+    try:
+        client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            # socket_timeout intentionally omitted —
+            # pub/sub connections must block indefinitely while waiting
+            # for messages. Setting socket_timeout causes spurious
+            # "Timeout reading from socket" warnings every few seconds.
+            retry_on_timeout=False,
+            health_check_interval=30
+        )
+        client.ping()
+        logger.info("Redis connected successfully.")
+        return client
+    except Exception as e:
+        logger.warning(f"Redis unavailable at startup (will run without live updates): {e}")
+        return None
+
+
+print("APP STARTUP: Attempting Redis connection...", flush=True, file=sys.stderr)
+redis_client = _init_redis()
+print(f"APP STARTUP: Redis {'connected' if redis_client else 'unavailable — continuing without it'}.", flush=True, file=sys.stderr)
+
+
 def redis_subscriber():
-    """Get updates from Redis and update local cache."""
-    global local_cache
+    """Background thread: subscribe to Redis and populate local_cache."""
+    global local_cache, redis_client
     if redis_client is None:
-        print("⚠️ Redis not available – subscriber not started")
+        logger.warning("Redis subscriber not started — no Redis connection.")
         return
 
     retry_count = 0
@@ -81,30 +92,36 @@ def redis_subscriber():
         try:
             pubsub = redis_client.pubsub()
             pubsub.subscribe('live_prices')
-            print("✅ Subscribed to Redis channel 'live_prices'")
+            logger.info("Subscribed to Redis channel 'live_prices'")
             for message in pubsub.listen():
                 if message['type'] == 'message':
                     try:
                         data = json.loads(message['data'])
                         with cache_lock:
                             local_cache = data
-                        retry_count = 0  # reset on success
+                        retry_count = 0
                     except Exception as e:
-                        print(f"⚠️ Error processing Redis message: {e}")
+                        logger.warning(f"Redis message parse error: {e}")
         except redis.ConnectionError as e:
             retry_count += 1
-            wait = min(2 ** retry_count, 30)  # exponential backoff
-            print(f"⚠️ Redis connection lost (attempt {retry_count}), reconnecting in {wait}s...")
+            wait = min(2 ** retry_count, 60)
+            logger.warning(f"Redis connection lost (attempt {retry_count}), retrying in {wait}s...")
             time.sleep(wait)
+            redis_client = _init_redis()
+            if redis_client is None:
+                time.sleep(wait)
         except Exception as e:
-            print(f"⚠️ Unexpected Redis error: {e}")
+            logger.warning(f"Unexpected Redis error in subscriber: {e}")
             time.sleep(5)
 
-# Start subscriber thread only if Redis is available
+
 if redis_client is not None:
-    threading.Thread(target=redis_subscriber, daemon=True).start()
+    t = threading.Thread(target=redis_subscriber, daemon=True)
+    t.start()
 else:
-    print("⚠️ Running without Redis – live updates disabled")
+    logger.warning("Running without Redis — live price updates disabled.")
+
+print("APP STARTUP: Redis subscriber configured.", flush=True, file=sys.stderr)
 
 start_time = time.time()
 request_count = 0
@@ -117,22 +134,26 @@ CACHE_DURATION = 1800
 memory_users = {}
 memory_users_lock = threading.Lock()
 
+
 def check_couchdb_connection():
     try:
         response = requests.get(COUCHDB_URL + "_up", timeout=3)
         if response.status_code == 200:
             state['couchdb_available'] = True
             return True
-    except:
-        state['couchdb_available'] = False
+    except Exception:
+        pass
+    state['couchdb_available'] = False
     return False
 
-print("⏳ Checking CouchDB...")
+
+print("APP STARTUP: Checking CouchDB...", flush=True, file=sys.stderr)
 try:
     check_couchdb_connection()
-    print(f"✅ CouchDB available: {state['couchdb_available']}")
+    print(f"APP STARTUP: CouchDB available: {state['couchdb_available']}", flush=True, file=sys.stderr)
 except Exception as e:
-    print(f"❌ CouchDB check failed: {e}")
+    print(f"APP STARTUP: CouchDB check failed (non-fatal): {e}", flush=True, file=sys.stderr)
+
 
 class User(UserMixin):
     def __init__(self, user_id, username, portfolio=None, password_hash=None):
@@ -155,7 +176,7 @@ class User(UserMixin):
                     with memory_users_lock:
                         memory_users[user_id] = user
                     return user
-            except:
+            except Exception:
                 pass
         return None
 
@@ -174,12 +195,14 @@ class User(UserMixin):
                 if resp.status_code == 200:
                     doc['_rev'] = resp.json()['_rev']
                 requests.put(COUCHDB_URL + "users/" + self.id, json=doc, timeout=5)
-            except:
+            except Exception:
                 pass
+
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.get(user_id)
+
 
 def get_market_status():
     ist = pytz.timezone('Asia/Kolkata')
@@ -193,14 +216,25 @@ def get_market_status():
     market_close = 15 * 60 + 30
     if market_open <= current_minutes <= market_close:
         return "Open"
-    else:
-        return "Closed"
+    return "Closed"
+
 
 @app.before_request
 def before_request():
     global request_count
     with request_lock:
         request_count += 1
+
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "healthy",
+        "redis": redis_client is not None,
+        "couchdb": state['couchdb_available'],
+        "uptime_seconds": round(time.time() - start_time, 1)
+    }), 200
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login_page():
@@ -220,20 +254,20 @@ def login_page():
                         if check_password_hash(doc.get('password_hash', ''), password):
                             user = User(doc['_id'], username, doc.get('portfolio', {}), doc.get('password_hash'))
                         break
-            except:
+            except Exception:
                 pass
         if not user:
             with memory_users_lock:
                 for uid, u in memory_users.items():
-                    if u.username == username and check_password_hash(u.password_hash, password):
+                    if u.username == username and check_password_hash(u.password_hash or '', password):
                         user = u
                         break
         if user:
             login_user(user)
             return redirect('/dashboard')
-        else:
-            return render_template_string(LOGIN_PAGE, error="Invalid credentials")
+        return render_template_string(LOGIN_PAGE, error="Invalid credentials")
     return render_template_string(LOGIN_PAGE)
+
 
 @app.route('/register', methods=['GET', 'POST'])
 def register_page():
@@ -251,7 +285,7 @@ def register_page():
                     if row.get('doc', {}).get('username') == username:
                         exists = True
                         break
-            except:
+            except Exception:
                 pass
         if not exists:
             with memory_users_lock:
@@ -269,11 +303,13 @@ def register_page():
         return redirect('/dashboard')
     return render_template_string(REGISTER_PAGE)
 
+
 @app.route('/logout')
 @login_required
 def logout():
     logout_user()
     return redirect('/')
+
 
 @app.route('/api/portfolio')
 @login_required
@@ -289,17 +325,13 @@ def get_portfolio():
                 resp = requests.get(COUCHDB_URL + DB_NAME + "/" + symbol, timeout=3)
                 if resp.status_code == 200:
                     price = resp.json().get('price', 0.0)
-            except:
+            except Exception:
                 pass
         value = price * qty
         total_value += value
-        holdings.append({
-            'symbol': symbol,
-            'quantity': qty,
-            'price': price,
-            'value': value
-        })
+        holdings.append({'symbol': symbol, 'quantity': qty, 'price': price, 'value': value})
     return jsonify({'holdings': holdings, 'total_value': total_value})
+
 
 @app.route('/api/buy', methods=['POST'])
 @login_required
@@ -308,7 +340,10 @@ def buy_stock():
     if not data:
         return jsonify({'error': 'Invalid request body'}), 400
     symbol = data.get('symbol', '').upper().strip()
-    quantity = int(data.get('quantity', 0))
+    try:
+        quantity = int(data.get('quantity', 0))
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Quantity must be an integer'}), 400
     if quantity <= 0:
         return jsonify({'error': 'Invalid quantity'}), 400
     with cache_lock:
@@ -319,13 +354,14 @@ def buy_stock():
             resp = requests.get(COUCHDB_URL + DB_NAME + "/" + symbol, timeout=3)
             if resp.status_code == 200:
                 price = resp.json().get('price', 0.0)
-        except:
+        except Exception:
             pass
     if price <= 0:
         return jsonify({'error': 'Stock data temporarily unavailable. Worker syncing.'}), 404
     current_user.portfolio[symbol] = current_user.portfolio.get(symbol, 0) + quantity
     current_user.save()
     return jsonify({'success': True, 'symbol': symbol, 'quantity': quantity, 'price': price})
+
 
 @app.route('/api/sell', methods=['POST'])
 @login_required
@@ -334,7 +370,10 @@ def sell_stock():
     if not data:
         return jsonify({'error': 'Invalid request body'}), 400
     symbol = data.get('symbol', '').upper().strip()
-    quantity = int(data.get('quantity', 0))
+    try:
+        quantity = int(data.get('quantity', 0))
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Quantity must be an integer'}), 400
     if quantity <= 0:
         return jsonify({'error': 'Invalid quantity'}), 400
     if current_user.portfolio.get(symbol, 0) < quantity:
@@ -347,7 +386,7 @@ def sell_stock():
             resp = requests.get(COUCHDB_URL + DB_NAME + "/" + symbol, timeout=3)
             if resp.status_code == 200:
                 price = resp.json().get('price', 0.0)
-        except:
+        except Exception:
             pass
     if price <= 0:
         return jsonify({'error': 'Stock data temporarily unavailable. Worker syncing.'}), 404
@@ -357,6 +396,7 @@ def sell_stock():
     current_user.save()
     return jsonify({'success': True, 'symbol': symbol, 'quantity': quantity, 'price': price})
 
+
 @app.route('/api/data')
 def get_data():
     with cache_lock:
@@ -365,13 +405,13 @@ def get_data():
         try:
             resp = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=3)
             current_data = [row['doc'] for row in resp.json().get('rows', []) if not row['id'].startswith('_design')]
-        except:
+        except Exception:
             pass
     try:
         mr_response = requests.get(COUCHDB_URL + DB_NAME + "/_design/analytics/_view/portfolio_value", timeout=2)
         mr_rows = mr_response.json().get('rows', [])
         total_value = mr_rows[0]['value'] if mr_rows else 0.0
-    except:
+    except Exception:
         total_value = sum(item.get('price', 0) for item in current_data)
     signals = {}
     exchanges = {}
@@ -390,6 +430,7 @@ def get_data():
         "market_status": get_market_status()
     })
 
+
 @app.route('/api/history/<ticker>')
 def get_history(ticker):
     try:
@@ -399,14 +440,15 @@ def get_history(ticker):
         stock = yf.Ticker(symbol)
         hist = stock.history(period="7d", interval="1h")
         if hist.empty:
-            raise Exception("Empty")
-        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist()  # type:ignore
+            raise Exception("Empty history")
+        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist()  # type: ignore
         prices = hist['Close'].round(2).tolist()
         return jsonify({"ticker": ticker, "dates": dates, "prices": prices})
-    except:
+    except Exception:
         dates = [(datetime.now() - timedelta(hours=i)).strftime('%Y-%m-%d %H:%M') for i in range(50, 0, -1)]
-        prices = [1000 + random.uniform(-50, 50) for _ in range(50)]
-        return jsonify({"ticker": ticker, "dates": dates, "prices": [round(p, 2) for p in prices]})
+        prices = [round(1000 + random.uniform(-50, 50), 2) for _ in range(50)]
+        return jsonify({"ticker": ticker, "dates": dates, "prices": prices})
+
 
 @app.route('/api/news/<ticker>')
 def get_news(ticker):
@@ -425,23 +467,35 @@ def get_news(ticker):
                 'source': entry.source[0].get('title', 'Google News') if hasattr(entry, 'source') and entry.source else 'Google News'
             })
         if not news_items:
-            raise Exception("No news")
+            raise Exception("No news found")
         news_cache[ticker] = news_items
         news_cache_time[ticker] = datetime.now()
         return jsonify({"ticker": ticker, "news": news_items})
-    except:
+    except Exception:
         return jsonify({"ticker": ticker, "news": [{'title': f'{ticker} market analysis updated.', 'link': '#', 'published': datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT'), 'source': 'Quantum System'}]})
+
 
 @app.route('/api/predict/<ticker>')
 def predict_stock(ticker):
+    """
+    ML prediction endpoint. The ml_model import happens HERE, not at startup.
+    If TensorFlow/CUDA/model loading fails, only this endpoint returns an error —
+    the rest of the app keeps running normally.
+    """
     ticker = ticker.upper().strip()
     try:
+        from ml_model import predict_next_day
         result = predict_next_day(ticker)
         if result is None:
             return jsonify({'error': 'Could not generate AI prediction for this ticker.'}), 400
         return jsonify(result)
+    except ImportError as e:
+        logger.error(f"ml_model import failed: {e}")
+        return jsonify({'error': 'ML engine unavailable on this deployment.'}), 503
     except Exception as e:
+        logger.error(f"Prediction error for {ticker}: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/')
 def index():
@@ -449,17 +503,15 @@ def index():
         return redirect('/dashboard')
     return render_template_string(LANDING_HTML)
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
     return render_template_string(DASHBOARD_HTML, username=current_user.username)
 
+
 # ==========================================
-# HTML TEMPLATES (FULLY EXPANDED & STYLED)
+# HTML TEMPLATES
 # ==========================================
 
 LOGIN_PAGE = '''
@@ -581,44 +633,21 @@ DASHBOARD_HTML = '''
             --border-light: rgba(255, 255, 255, 0.08);
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
-            
             --brand: #00f2fe;
             --brand-gradient: linear-gradient(135deg, #00f2fe, #4facfe);
-            
             --up: #00ff87;
             --down: #ff3366;
             --warn: #ffd966;
-            
             --font-sans: 'Inter', sans-serif;
             --font-mono: 'JetBrains Mono', monospace;
         }
-
         * { margin:0; padding:0; box-sizing:border-box; }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: var(--bg-base); }
         ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: var(--brand); }
-
-        body {
-            background-color: var(--bg-base);
-            color: var(--text-main);
-            font-family: var(--font-sans);
-            padding: 20px;
-            min-height: 100vh;
-        }
-
-        .top-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 16px 24px;
-            background: var(--bg-panel);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--border-light);
-            border-radius: 16px;
-            margin-bottom: 24px;
-        }
-        
+        body { background-color: var(--bg-base); color: var(--text-main); font-family: var(--font-sans); padding: 20px; min-height: 100vh; }
+        .top-bar { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: var(--bg-panel); backdrop-filter: blur(12px); border: 1px solid var(--border-light); border-radius: 16px; margin-bottom: 24px; }
         .logo { font-size: 1.5rem; font-weight: 700; background: var(--brand-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: -0.5px; }
         .sys-status { display: flex; gap: 16px; align-items: center; font-size: 0.875rem; font-weight: 500; }
         .status-badge { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: rgba(0,0,0,0.3); border-radius: 20px; border: 1px solid var(--border-light); }
@@ -626,7 +655,6 @@ DASHBOARD_HTML = '''
         .op-tag { color: var(--text-muted); }
         .logout { color: var(--text-main); text-decoration: none; padding: 6px 16px; background: rgba(255, 51, 102, 0.1); border: 1px solid rgba(255, 51, 102, 0.3); border-radius: 20px; transition: 0.2s; }
         .logout:hover { background: rgba(255, 51, 102, 0.2); }
-
         .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin-bottom: 24px; }
         .kpi-card { background: var(--bg-panel); backdrop-filter: blur(12px); border: 1px solid var(--border-light); border-radius: 16px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; }
         .kpi-title { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; margin-bottom: 8px; }
@@ -634,30 +662,23 @@ DASHBOARD_HTML = '''
         .kpi-value.brand { color: var(--brand); }
         .kpi-value.up { color: var(--up); }
         .kpi-value.warn { color: var(--warn); }
-
         .dashboard-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; margin-bottom: 24px; }
         .grid-3-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 24px; }
-        
         .panel { background: var(--bg-panel); backdrop-filter: blur(12px); border: 1px solid var(--border-light); border-radius: 16px; display: flex; flex-direction: column; overflow: hidden; }
         .panel-head { padding: 16px 20px; border-bottom: 1px solid var(--border-light); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
         .panel-body { padding: 20px; flex: 1; overflow-y: auto; }
         .panel-body.no-pad { padding: 0; }
-
         .chart-box { height: 300px; width: 100%; position: relative; }
-        .small-chart { height: 200px; width: 100%; position: relative; }
-
         table { width: 100%; border-collapse: collapse; text-align: left; }
         th { padding: 12px 20px; background: rgba(0,0,0,0.2); font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; position: sticky; top: 0; backdrop-filter: blur(5px); }
         td { padding: 12px 20px; border-bottom: 1px solid rgba(255,255,255,0.03); font-size: 0.875rem; transition: background 0.2s; }
         tr:hover td { background: rgba(255,255,255,0.02); }
-        
         .mono { font-family: var(--font-mono); }
         .up { color: var(--up); }
         .down { color: var(--down); }
         .tag { padding: 4px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; background: rgba(255,255,255,0.05); }
         .tag.up { color: #000; background: var(--up); }
         .tag.down { color: #fff; background: var(--down); }
-
         .trade-form { display: flex; gap: 12px; }
         select, input { flex: 1; background: rgba(0,0,0,0.3); border: 1px solid var(--border-light); color: white; padding: 12px; border-radius: 8px; font-family: var(--font-sans); outline: none; transition: 0.2s; }
         select:focus, input:focus { border-color: var(--brand); }
@@ -668,20 +689,15 @@ DASHBOARD_HTML = '''
         .btn-sell:hover { box-shadow: 0 0 15px rgba(255,51,102,0.4); }
         .btn-ai { background: transparent; border: 1px solid var(--brand); color: var(--brand); padding: 6px 12px; font-size: 0.75rem; border-radius: 4px; cursor: pointer; }
         .btn-ai:hover { background: var(--brand); color: #000; }
-
         .news-item { padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,0.03); transition: 0.2s; display: block; text-decoration: none; }
         .news-item:hover { background: rgba(255,255,255,0.02); transform: translateX(5px); }
         .news-title { color: var(--text-main); font-weight: 500; font-size: 0.875rem; margin-bottom: 6px; line-height: 1.4; }
         .news-meta { color: var(--text-muted); font-size: 0.75rem; }
-
-        /* Smooth Flash Animation for Live Updates */
         .flash-up { animation: flash-green 0.8s ease-out; }
         .flash-down { animation: flash-red 0.8s ease-out; }
         @keyframes flash-green { 0% { background-color: rgba(0, 255, 135, 0.2); } 100% { background-color: transparent; } }
         @keyframes flash-red { 0% { background-color: rgba(255, 51, 102, 0.2); } 100% { background-color: transparent; } }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-
-        /* Modal Styles */
         .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(10, 15, 28, 0.85); backdrop-filter: blur(8px); z-index: 1000; align-items: center; justify-content: center; }
         .modal { background: #12192d; border: 1px solid var(--brand); border-radius: 16px; width: 100%; max-width: 450px; box-shadow: 0 20px 50px rgba(0,242,254,0.2); }
         .modal-head { padding: 20px; border-bottom: 1px solid var(--border-light); display: flex; justify-content: space-between; align-items: center; }
@@ -709,11 +725,11 @@ DASHBOARD_HTML = '''
     <div class="kpi-grid">
         <div class="kpi-card">
             <div class="kpi-title">Net Portfolio Value</div>
-            <div class="kpi-value brand mono" id="port-total">₹0.00</div>
+            <div class="kpi-value brand mono" id="port-total">&#8377;0.00</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">Global Market Cap</div>
-            <div class="kpi-value up mono" id="sys-cap">₹0.00</div>
+            <div class="kpi-value up mono" id="sys-cap">&#8377;0.00</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">NSE Assets</div>
@@ -738,12 +754,11 @@ DASHBOARD_HTML = '''
                     <input type="number" id="trade-qty" placeholder="Quantity">
                 </div>
                 <div class="trade-form">
-                    <button class="btn btn-buy" onclick="execTrade('buy')" style="flex:1">Buy Limit</button>
-                    <button class="btn btn-sell" onclick="execTrade('sell')" style="flex:1">Sell Limit</button>
+                    <button class="btn btn-buy" onclick="execTrade(\'buy\')" style="flex:1">Buy Limit</button>
+                    <button class="btn btn-sell" onclick="execTrade(\'sell\')" style="flex:1">Sell Limit</button>
                 </div>
             </div>
         </div>
-        
         <div class="panel">
             <div class="panel-head">Active Positions</div>
             <div class="panel-body no-pad">
@@ -767,24 +782,23 @@ DASHBOARD_HTML = '''
                 <div class="chart-box"><canvas id="mainChart"></canvas></div>
             </div>
         </div>
-        
         <div class="panel" style="display: flex; flex-direction: column;">
             <div class="panel-head">System Distribution</div>
             <div class="panel-body" style="display: flex; flex-direction: column; gap: 20px;">
                 <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
                     <div style="width: 150px; height: 150px;"><canvas id="exchangeChart"></canvas></div>
                     <div style="margin-left: 20px; font-size: 0.8rem; color: var(--text-muted);">
-                        <div><span style="color:#00ff87">■</span> NSE</div>
-                        <div><span style="color:#00f2fe">■</span> NASDAQ</div>
-                        <div><span style="color:#b026ff">■</span> Crypto</div>
+                        <div><span style="color:#00ff87">&#9632;</span> NSE</div>
+                        <div><span style="color:#00f2fe">&#9632;</span> NASDAQ</div>
+                        <div><span style="color:#b026ff">&#9632;</span> Crypto</div>
                     </div>
                 </div>
                 <div style="flex: 1; display: flex; align-items: center; justify-content: center; border-top: 1px solid var(--border-light); padding-top: 20px;">
                     <div style="width: 150px; height: 150px;"><canvas id="signalChart"></canvas></div>
                     <div style="margin-left: 20px; font-size: 0.8rem; color: var(--text-muted);">
-                        <div><span style="color:#00ff87">■</span> BUY</div>
-                        <div><span style="color:#ff3366">■</span> SELL</div>
-                        <div><span style="color:#64748b">■</span> HOLD</div>
+                        <div><span style="color:#00ff87">&#9632;</span> BUY</div>
+                        <div><span style="color:#ff3366">&#9632;</span> SELL</div>
+                        <div><span style="color:#64748b">&#9632;</span> HOLD</div>
                     </div>
                 </div>
             </div>
@@ -801,7 +815,6 @@ DASHBOARD_HTML = '''
                 </table>
             </div>
         </div>
-        
         <div class="panel">
             <div class="panel-head">Technical Indicators</div>
             <div class="panel-body no-pad" style="max-height: 400px;">
@@ -811,7 +824,6 @@ DASHBOARD_HTML = '''
                 </table>
             </div>
         </div>
-
         <div class="panel">
             <div class="panel-head">Intelligence Feed</div>
             <div class="panel-body no-pad" id="news-container" style="max-height: 400px;">
@@ -819,20 +831,16 @@ DASHBOARD_HTML = '''
             </div>
         </div>
     </div>
-    
+
     <div class="panel" style="margin-bottom: 40px;">
         <div class="panel-head">Full Institutional Ledger & Inference</div>
         <div class="panel-body no-pad" style="max-height: 400px;">
             <table>
                 <thead>
                     <tr>
-                        <th>Symbol</th>
-                        <th>Exchange</th>
-                        <th style="text-align:right">Last</th>
-                        <th style="text-align:right">Net Chg</th>
-                        <th style="text-align:center">RSI</th>
-                        <th style="text-align:right">Volume</th>
-                        <th style="text-align:center">Action</th>
+                        <th>Symbol</th><th>Exchange</th><th style="text-align:right">Last</th>
+                        <th style="text-align:right">Net Chg</th><th style="text-align:center">RSI</th>
+                        <th style="text-align:right">Volume</th><th style="text-align:center">Action</th>
                     </tr>
                 </thead>
                 <tbody id="detailed-body"></tbody>
@@ -884,16 +892,16 @@ DASHBOARD_HTML = '''
 
         function loadPort() {
             fetch('/api/portfolio').then(r=>r.json()).then(d=>{
-                document.getElementById('port-total').innerText = '₹' + d.total_value.toLocaleString('en-IN', {minimumFractionDigits:2});
+                document.getElementById('port-total').innerText = '\u20b9' + d.total_value.toLocaleString('en-IN', {minimumFractionDigits:2});
                 document.getElementById('pos-body').innerHTML = d.holdings.map(h=>`
                     <tr>
                         <td class="mono" style="font-weight:600;">${h.symbol}</td>
                         <td class="mono">${h.quantity}</td>
                         <td class="mono">${h.price.toFixed(2)}</td>
-                        <td class="mono" style="color:var(--brand)">₹${h.value.toLocaleString('en-IN')}</td>
+                        <td class="mono" style="color:var(--brand)">\u20b9${h.value.toLocaleString('en-IN')}</td>
                     </tr>
                 `).join('');
-            });
+            }).catch(()=>{});
         }
 
         function execTrade(type) {
@@ -904,14 +912,14 @@ DASHBOARD_HTML = '''
             .then(r=>r.json()).then(d=>{
                 if(d.success) { loadPort(); document.getElementById('trade-qty').value=''; }
                 else alert(d.error);
-            });
+            }).catch(()=>{});
         }
 
         function loadHist(sym) {
             curSym = sym; document.getElementById('chart-lbl').innerText = sym;
             fetch(`/api/history/${sym}`).then(r=>r.json()).then(d=>{
                 if(d.dates) { mainChart.data.labels = d.dates; mainChart.data.datasets[0].data = d.prices; mainChart.update('none'); }
-            });
+            }).catch(()=>{});
         }
 
         function loadNewsFeed(sym) {
@@ -921,11 +929,11 @@ DASHBOARD_HTML = '''
                     c.innerHTML = d.news.map(n=>`
                         <a href="${n.link}" target="_blank" class="news-item">
                             <div class="news-title">${n.title}</div>
-                            <div class="news-meta">${n.source} • ${new Date(n.published).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+                            <div class="news-meta">${n.source} \u2022 ${new Date(n.published).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
                         </a>
                     `).join('');
                 }
-            });
+            }).catch(()=>{});
         }
 
         function clickRow(sym) {
@@ -949,19 +957,19 @@ DASHBOARD_HTML = '''
                 document.getElementById('m-engine').innerText = 'Engine: ' + d.model_used;
                 document.getElementById('ai-modal').style.display = 'flex';
                 setTimeout(() => document.getElementById('m-bar').style.width = conf + '%', 50);
-            });
+            }).catch(err => { btn.innerText = orig; alert('ML engine error: ' + err); });
         }
 
         function closeModal() { document.getElementById('ai-modal').style.display = 'none'; }
 
-        function formatPx(val, ex) { return (ex==='NASDAQ (US)'?'$':'₹') + parseFloat(val).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+        function formatPx(val, ex) { return (ex==='NASDAQ (US)'?'$':'\u20b9') + parseFloat(val).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
 
         function pollData() {
             fetch('/api/data').then(r=>r.json()).then(d=>{
-                document.getElementById('sys-cap').innerText = '₹' + (d.mapreduce_total/10000000).toFixed(2) + ' Cr';
+                document.getElementById('sys-cap').innerText = '\u20b9' + (d.mapreduce_total/10000000).toFixed(2) + ' Cr';
                 const mkt = d.market_status;
                 const mktBadge = document.getElementById('market-badge');
-                mktBadge.innerHTML = `<div class="dot" style="background:${mkt.includes('Active')?'var(--up)':'var(--text-muted)'}; box-shadow: 0 0 10px ${mkt.includes('Active')?'var(--up)':'transparent'};"></div> <span id="market-status">${mkt.toUpperCase()}</span>`;
+                mktBadge.innerHTML = `<div class="dot" style="background:${mkt.includes('Open')?'var(--up)':'var(--text-muted)'}; box-shadow: 0 0 10px ${mkt.includes('Open')?'var(--up)':'transparent'};"></div> <span>${mkt.toUpperCase()}</span>`;
                 let nse=0, us=0, crypto=0, b=0, s=0, h=0;
                 let selOpts = '';
                 let htmlPrices = '', htmlRsi = '', htmlDetail = '';
@@ -976,36 +984,12 @@ DASHBOARD_HTML = '''
                     if(stk.signal==='BUY') sigCls += 'up'; else if(stk.signal==='SELL') sigCls += 'down'; else sigCls += 'tag';
                     const oldPx = prevPrices[stk.ticker];
                     let flash = '';
-                    if (oldPx && oldPx !== stk.price) {
-                        flash = stk.price > oldPx ? 'flash-up' : 'flash-down';
-                    }
+                    if (oldPx && oldPx !== stk.price) flash = stk.price > oldPx ? 'flash-up' : 'flash-down';
                     prevPrices[stk.ticker] = stk.price;
                     const pFmt = formatPx(stk.price, stk.exchange);
-                    htmlPrices += `
-                        <tr onclick="clickRow('${stk.ticker}')">
-                            <td class="mono" style="font-weight:600;">${stk.ticker}</td>
-                            <td class="mono ${flash}" style="text-align:right">${pFmt}</td>
-                            <td class="mono ${cCls}" style="text-align:right">${sign}${stk.change_percent.toFixed(2)}%</td>
-                        </tr>
-                    `;
-                    htmlRsi += `
-                        <tr onclick="clickRow('${stk.ticker}')">
-                            <td class="mono" style="font-weight:600;">${stk.ticker}</td>
-                            <td class="mono" style="color:${stk.rsi<30?'var(--up)':stk.rsi>70?'var(--down)':'var(--text-main)'}">${stk.rsi.toFixed(1)}</td>
-                            <td style="text-align:left"><span class="${sigCls}">${stk.signal}</span></td>
-                        </tr>
-                    `;
-                    htmlDetail += `
-                        <tr onclick="clickRow('${stk.ticker}')">
-                            <td class="mono" style="font-weight:600; color:var(--brand)">${stk.ticker}</td>
-                            <td style="font-size:0.75rem; color:var(--text-muted)">${stk.exchange}</td>
-                            <td class="mono ${flash}" style="text-align:right">${pFmt}</td>
-                            <td class="mono ${cCls}" style="text-align:right">${sign}${stk.change.toFixed(2)}</td>
-                            <td class="mono" style="text-align:center">${stk.rsi.toFixed(1)}</td>
-                            <td class="mono" style="text-align:right; color:var(--text-muted)">${(stk.volume||0).toLocaleString()}</td>
-                            <td style="text-align:center"><button class="btn-ai" onclick="runInference('${stk.ticker}', event)">Execute ML</button></td>
-                        </tr>
-                    `;
+                    htmlPrices += `<tr onclick="clickRow('${stk.ticker}')"><td class="mono" style="font-weight:600;">${stk.ticker}</td><td class="mono ${flash}" style="text-align:right">${pFmt}</td><td class="mono ${cCls}" style="text-align:right">${sign}${stk.change_percent.toFixed(2)}%</td></tr>`;
+                    htmlRsi += `<tr onclick="clickRow('${stk.ticker}')"><td class="mono" style="font-weight:600;">${stk.ticker}</td><td class="mono" style="color:${stk.rsi<30?'var(--up)':stk.rsi>70?'var(--down)':'var(--text-main)'}">${stk.rsi.toFixed(1)}</td><td style="text-align:left"><span class="${sigCls}">${stk.signal}</span></td></tr>`;
+                    htmlDetail += `<tr onclick="clickRow('${stk.ticker}')"><td class="mono" style="font-weight:600; color:var(--brand)">${stk.ticker}</td><td style="font-size:0.75rem; color:var(--text-muted)">${stk.exchange}</td><td class="mono ${flash}" style="text-align:right">${pFmt}</td><td class="mono ${cCls}" style="text-align:right">${sign}${stk.change.toFixed(2)}</td><td class="mono" style="text-align:center">${stk.rsi.toFixed(1)}</td><td class="mono" style="text-align:right; color:var(--text-muted)">${(stk.volume||0).toLocaleString()}</td><td style="text-align:center"><button class="btn-ai" onclick="runInference('${stk.ticker}', event)">Execute ML</button></td></tr>`;
                 });
                 document.getElementById('kpi-nse').innerText = nse;
                 document.getElementById('kpi-us').innerText = us;
@@ -1017,7 +1001,7 @@ DASHBOARD_HTML = '''
                 document.getElementById('detailed-body').innerHTML = htmlDetail;
                 const sel = document.getElementById('trade-sym');
                 if(sel.options.length === 0) sel.innerHTML = selOpts;
-            });
+            }).catch(()=>{});
         }
 
         initCharts(); pollData(); loadPort(); loadHist(curSym); loadNewsFeed(curSym);
@@ -1028,4 +1012,6 @@ DASHBOARD_HTML = '''
 '''
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
+    port = int(os.getenv('PORT', 5000))
+    print(f"APP STARTUP: Starting Flask dev server on port {port}", flush=True, file=sys.stderr)
+    app.run(host='0.0.0.0', port=port, debug=False)

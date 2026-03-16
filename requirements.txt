@@ -8,6 +8,8 @@ numpy==1.24.3
 feedparser==6.0.10
 pytz==2023.3
 scikit-learn==1.3.2
-tensorflow==2.15.0
+# tensorflow-cpu: no GPU needed on Railway, smaller image, actually installs on Python 3.9
+# tensorflow 2.13.x is the last version with full Python 3.9 + slim-bullseye support
+tensorflow-cpu==2.13.0
 redis==5.0.1
-gunicorn==20.1.0
+gunicorn==21.2.0
