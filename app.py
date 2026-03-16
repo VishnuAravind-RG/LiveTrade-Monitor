@@ -1,3 +1,6 @@
+# TEMPORARY: Force Redis off to test web app startup
+import os
+os.environ['REDIS_URL'] = 'redis://localhost:6379'  # Override any Railway URL
 from flask import Flask, jsonify, request, Response, redirect, url_for, render_template_string
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
