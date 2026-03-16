@@ -131,8 +131,6 @@ try:
 except Exception as e:
     print(f"❌ CouchDB check failed: {e}")
 
-
-
 class User(UserMixin):
     def __init__(self, user_id, username, portfolio=None, password_hash=None):
         self.id = user_id
