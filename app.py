@@ -20,10 +20,7 @@ import yfinance as yf
 from ml_model import predict_next_day
 
 print("🚀 Starting app.py initialization...")
-
-# Add this right after your imports
 print("✅ Imports done")
-
 print("🚀 Starting core initialization...")
 
 app = Flask(__name__)
@@ -34,13 +31,27 @@ logger = logging.getLogger(__name__)
 
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login_page' #type:ignore
+login_manager.login_view = 'login_page'  # type: ignore
 
 COUCHDB_URL = os.getenv("COUCHDB_URL", "http://admin:password@couchdb:5984/")
 DB_NAME = "stocks"
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Connect to Redis with timeout
+print("⏳ Connecting to Redis...")
+redis_client = None
+try:
+    redis_client = redis.Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3
+    )
+    redis_client.ping()
+    print("✅ Redis connected")
+except Exception as e:
+    print(f"❌ Redis connection failed: {e}")
 
 start_time = time.time()
 request_count = 0
@@ -65,17 +76,6 @@ def check_couchdb_connection():
         state['couchdb_available'] = False
     return False
 
-# Before Redis connection
-print("⏳ Connecting to Redis...")
-try:
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
-    redis_client.ping()
-    print("✅ Redis connected")
-except Exception as e:
-    print(f"❌ Redis connection failed: {e}")
-    redis_client = None
-
-# Before CouchDB check
 print("⏳ Checking CouchDB...")
 try:
     check_couchdb_connection()
@@ -86,23 +86,26 @@ except Exception as e:
 print("🚀 About to start subscriber thread...")
 
 def redis_subscriber():
+    global local_cache
     if redis_client is None:
         print("⚠️ Redis unavailable, subscriber thread idle")
         return
     pubsub = redis_client.pubsub()
+    pubsub.subscribe('live_prices')
+    print("✅ Subscribed to Redis channel")
     while True:
         try:
-            pubsub.subscribe('live_prices')
             for message in pubsub.listen():
                 if message['type'] == 'message':
                     data = json.loads(message['data'])
                     with cache_lock:
-                        global local_cache
                         local_cache = data
-        except:
+        except Exception as e:
+            print(f"❌ Redis subscriber error: {e}")
             time.sleep(2)
 
-threading.Thread(target=redis_subscriber, daemon=True).start()
+if redis_client is not None:
+    threading.Thread(target=redis_subscriber, daemon=True).start()
 
 class User(UserMixin):
     def __init__(self, user_id, username, portfolio=None, password_hash=None):
@@ -252,7 +255,6 @@ def get_portfolio():
     total_value = 0.0
     with cache_lock:
         current_data = {item.get('ticker'): item for item in local_cache}
-        
     for symbol, qty in current_user.portfolio.items():
         price = current_data.get(symbol, {}).get('price', 0.0)
         if price <= 0 and state['couchdb_available']:
@@ -262,7 +264,6 @@ def get_portfolio():
                     price = resp.json().get('price', 0.0)
             except:
                 pass
-                
         value = price * qty
         total_value += value
         holdings.append({
@@ -283,11 +284,9 @@ def buy_stock():
     quantity = int(data.get('quantity', 0))
     if quantity <= 0:
         return jsonify({'error': 'Invalid quantity'}), 400
-        
     with cache_lock:
         current_data = {item.get('ticker'): item for item in local_cache}
     price = current_data.get(symbol, {}).get('price', 0.0)
-    
     if price <= 0 and state['couchdb_available']:
         try:
             resp = requests.get(COUCHDB_URL + DB_NAME + "/" + symbol, timeout=3)
@@ -295,10 +294,8 @@ def buy_stock():
                 price = resp.json().get('price', 0.0)
         except:
             pass
-
     if price <= 0:
         return jsonify({'error': 'Stock data temporarily unavailable. Worker syncing.'}), 404
-        
     current_user.portfolio[symbol] = current_user.portfolio.get(symbol, 0) + quantity
     current_user.save()
     return jsonify({'success': True, 'symbol': symbol, 'quantity': quantity, 'price': price})
@@ -315,11 +312,9 @@ def sell_stock():
         return jsonify({'error': 'Invalid quantity'}), 400
     if current_user.portfolio.get(symbol, 0) < quantity:
         return jsonify({'error': 'Insufficient shares in portfolio'}), 400
-        
     with cache_lock:
         current_data = {item.get('ticker'): item for item in local_cache}
     price = current_data.get(symbol, {}).get('price', 0.0)
-    
     if price <= 0 and state['couchdb_available']:
         try:
             resp = requests.get(COUCHDB_URL + DB_NAME + "/" + symbol, timeout=3)
@@ -327,10 +322,8 @@ def sell_stock():
                 price = resp.json().get('price', 0.0)
         except:
             pass
-
     if price <= 0:
         return jsonify({'error': 'Stock data temporarily unavailable. Worker syncing.'}), 404
-        
     current_user.portfolio[symbol] -= quantity
     if current_user.portfolio[symbol] == 0:
         del current_user.portfolio[symbol]
@@ -341,21 +334,18 @@ def sell_stock():
 def get_data():
     with cache_lock:
         current_data = list(local_cache)
-        
     if not current_data and state['couchdb_available']:
         try:
             resp = requests.get(COUCHDB_URL + DB_NAME + "/_all_docs?include_docs=true", timeout=3)
             current_data = [row['doc'] for row in resp.json().get('rows', []) if not row['id'].startswith('_design')]
         except:
             pass
-
     try:
         mr_response = requests.get(COUCHDB_URL + DB_NAME + "/_design/analytics/_view/portfolio_value", timeout=2)
         mr_rows = mr_response.json().get('rows', [])
         total_value = mr_rows[0]['value'] if mr_rows else 0.0
     except:
         total_value = sum(item.get('price', 0) for item in current_data)
-        
     signals = {}
     exchanges = {}
     for item in current_data:
@@ -363,7 +353,6 @@ def get_data():
         exc = item.get('exchange', 'Unknown')
         signals[sig] = signals.get(sig, 0) + 1
         exchanges[exc] = exchanges.get(exc, 0) + 1
-        
     return jsonify({
         "server_id": socket.gethostname(),
         "stock_data": current_data,
@@ -384,7 +373,7 @@ def get_history(ticker):
         hist = stock.history(period="7d", interval="1h")
         if hist.empty:
             raise Exception("Empty")
-        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist() #type:ignore
+        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist()  # type:ignore
         prices = hist['Close'].round(2).tolist()
         return jsonify({"ticker": ticker, "dates": dates, "prices": prices})
     except:
@@ -849,21 +838,16 @@ DASHBOARD_HTML = '''
         Chart.defaults.font.family = "'JetBrains Mono', monospace";
 
         function initCharts() {
-            // Main Line Chart
             mainChart = new Chart(document.getElementById('mainChart').getContext('2d'), {
                 type: 'line',
                 data: { labels: [], datasets: [{ data: [], borderColor: '#00f2fe', backgroundColor: 'rgba(0, 242, 254, 0.1)', borderWidth: 2, pointRadius: 0, fill: true, tension: 0.3 }]},
                 options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { position: 'right', grid: { color: 'rgba(255,255,255,0.05)' }, border: { display: false } } } }
             });
-
-            // Exchange Doughnut
             exChart = new Chart(document.getElementById('exchangeChart').getContext('2d'), {
                 type: 'doughnut',
                 data: { labels: ['NSE', 'NASDAQ', 'Crypto'], datasets: [{ data: [0,0,0], backgroundColor: ['#00ff87', '#00f2fe', '#b026ff'], borderWidth: 0 }] },
                 options: { responsive: true, maintainAspectRatio: false, cutout: '75%', plugins: { legend: { display: false } } }
             });
-
-            // Signal Doughnut
             sigChart = new Chart(document.getElementById('signalChart').getContext('2d'), {
                 type: 'doughnut',
                 data: { labels: ['BUY', 'SELL', 'HOLD'], datasets: [{ data: [0,0,0], backgroundColor: ['#00ff87', '#ff3366', '#64748b'], borderWidth: 0 }] },
@@ -929,16 +913,13 @@ DASHBOARD_HTML = '''
                 if(d.error) return alert(d.error);
                 document.getElementById('m-title').innerText = `${sym} Matrix`;
                 document.getElementById('m-cur').innerText = d.current_price.toFixed(2);
-                
                 const p = document.getElementById('m-pred');
                 p.innerText = d.predicted_price.toFixed(2);
                 p.className = 'm-val ' + (d.predicted_price > d.current_price ? 'up' : 'down');
-                
                 const conf = (d.confidence * 100).toFixed(1);
                 document.getElementById('m-conf').innerText = conf + '%';
                 document.getElementById('m-bar').style.width = '0%';
                 document.getElementById('m-engine').innerText = 'Engine: ' + d.model_used;
-                
                 document.getElementById('ai-modal').style.display = 'flex';
                 setTimeout(() => document.getElementById('m-bar').style.width = conf + '%', 50);
             });
@@ -951,39 +932,28 @@ DASHBOARD_HTML = '''
         function pollData() {
             fetch('/api/data').then(r=>r.json()).then(d=>{
                 document.getElementById('sys-cap').innerText = '₹' + (d.mapreduce_total/10000000).toFixed(2) + ' Cr';
-                
                 const mkt = d.market_status;
                 const mktBadge = document.getElementById('market-badge');
                 mktBadge.innerHTML = `<div class="dot" style="background:${mkt.includes('Active')?'var(--up)':'var(--text-muted)'}; box-shadow: 0 0 10px ${mkt.includes('Active')?'var(--up)':'transparent'};"></div> <span id="market-status">${mkt.toUpperCase()}</span>`;
-
                 let nse=0, us=0, crypto=0, b=0, s=0, h=0;
                 let selOpts = '';
-                
                 let htmlPrices = '', htmlRsi = '', htmlDetail = '';
-
                 d.stock_data.forEach(stk => {
                     if(stk.exchange==='NSE (India)') nse++; else if(stk.exchange==='NASDAQ (US)') us++; else crypto++;
                     if(stk.signal==='BUY') b++; else if(stk.signal==='SELL') s++; else h++;
-                    
                     selOpts += `<option value="${stk.ticker}">${stk.ticker}</option>`;
-                    
                     const isUp = stk.change >= 0;
                     const cCls = isUp ? 'up' : 'down';
                     const sign = isUp ? '+' : '';
-                    
                     let sigCls = 'tag ';
                     if(stk.signal==='BUY') sigCls += 'up'; else if(stk.signal==='SELL') sigCls += 'down'; else sigCls += 'tag';
-
                     const oldPx = prevPrices[stk.ticker];
                     let flash = '';
                     if (oldPx && oldPx !== stk.price) {
                         flash = stk.price > oldPx ? 'flash-up' : 'flash-down';
                     }
                     prevPrices[stk.ticker] = stk.price;
-
                     const pFmt = formatPx(stk.price, stk.exchange);
-
-                    // Row for Prices Table
                     htmlPrices += `
                         <tr onclick="clickRow('${stk.ticker}')">
                             <td class="mono" style="font-weight:600;">${stk.ticker}</td>
@@ -991,8 +961,6 @@ DASHBOARD_HTML = '''
                             <td class="mono ${cCls}" style="text-align:right">${sign}${stk.change_percent.toFixed(2)}%</td>
                         </tr>
                     `;
-
-                    // Row for RSI Table
                     htmlRsi += `
                         <tr onclick="clickRow('${stk.ticker}')">
                             <td class="mono" style="font-weight:600;">${stk.ticker}</td>
@@ -1000,8 +968,6 @@ DASHBOARD_HTML = '''
                             <td style="text-align:left"><span class="${sigCls}">${stk.signal}</span></td>
                         </tr>
                     `;
-
-                    // Row for Detailed Table
                     htmlDetail += `
                         <tr onclick="clickRow('${stk.ticker}')">
                             <td class="mono" style="font-weight:600; color:var(--brand)">${stk.ticker}</td>
@@ -1014,18 +980,14 @@ DASHBOARD_HTML = '''
                         </tr>
                     `;
                 });
-
                 document.getElementById('kpi-nse').innerText = nse;
                 document.getElementById('kpi-us').innerText = us;
                 document.getElementById('kpi-crypto').innerText = crypto;
-                
                 exChart.data.datasets[0].data = [nse, us, crypto]; exChart.update();
                 sigChart.data.datasets[0].data = [b, s, h]; sigChart.update();
-
                 document.getElementById('prices-body').innerHTML = htmlPrices;
                 document.getElementById('rsi-body').innerHTML = htmlRsi;
                 document.getElementById('detailed-body').innerHTML = htmlDetail;
-                
                 const sel = document.getElementById('trade-sym');
                 if(sel.options.length === 0) sel.innerHTML = selOpts;
             });
