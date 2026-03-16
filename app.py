@@ -32,9 +32,8 @@ login_manager.login_view = 'login_page'
 COUCHDB_URL = os.getenv("COUCHDB_URL", "http://admin:password@couchdb:5984/")
 DB_NAME = "stocks"
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
-REDIS_HOST = os.getenv('REDIS_URL', 'localhost')
-
-redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 start_time = time.time()
 request_count = 0
@@ -405,6 +404,10 @@ def index():
     if current_user.is_authenticated:
         return redirect('/dashboard')
     return render_template_string(LANDING_HTML)
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
 
 @app.route('/dashboard')
 @login_required
