@@ -38,20 +38,70 @@ DB_NAME = "stocks"
 ENVIRONMENT = os.getenv('ENVIRONMENT', 'production')
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# Connect to Redis with timeout
-print("⏳ Connecting to Redis...")
+# ==========================================
+# REDIS CONNECTION – FULLY OPTIONAL
+# ==========================================
 redis_client = None
+local_cache = []
+cache_lock = threading.Lock()
+
+print("⏳ Connecting to Redis...")
 try:
     redis_client = redis.Redis.from_url(
         REDIS_URL,
         decode_responses=True,
-        socket_connect_timeout=3,
-        socket_timeout=3
+        socket_connect_timeout=2,
+        socket_timeout=2,
+        retry_on_timeout=False,
+        health_check_interval=30
     )
-    redis_client.ping()
-    print("✅ Redis connected")
+    # Test connection quickly
+    if redis_client.ping():
+        print("✅ Redis connected")
+    else:
+        redis_client = None
+        print("⚠️ Redis ping failed")
 except Exception as e:
-    print(f"❌ Redis connection failed: {e}")
+    print(f"⚠️ Redis unavailable (will run without live updates): {e}")
+    redis_client = None
+
+# Background subscriber thread – runs only if Redis is available
+def redis_subscriber():
+    """Get updates from Redis and update local cache."""
+    global local_cache
+    if redis_client is None:
+        print("⚠️ Redis not available – subscriber not started")
+        return
+
+    retry_count = 0
+    while True:
+        try:
+            pubsub = redis_client.pubsub()
+            pubsub.subscribe('live_prices')
+            print("✅ Subscribed to Redis channel 'live_prices'")
+            for message in pubsub.listen():
+                if message['type'] == 'message':
+                    try:
+                        data = json.loads(message['data'])
+                        with cache_lock:
+                            local_cache = data
+                        retry_count = 0  # reset on success
+                    except Exception as e:
+                        print(f"⚠️ Error processing Redis message: {e}")
+        except redis.ConnectionError as e:
+            retry_count += 1
+            wait = min(2 ** retry_count, 30)  # exponential backoff
+            print(f"⚠️ Redis connection lost (attempt {retry_count}), reconnecting in {wait}s...")
+            time.sleep(wait)
+        except Exception as e:
+            print(f"⚠️ Unexpected Redis error: {e}")
+            time.sleep(5)
+
+# Start subscriber thread only if Redis is available
+if redis_client is not None:
+    threading.Thread(target=redis_subscriber, daemon=True).start()
+else:
+    print("⚠️ Running without Redis – live updates disabled")
 
 start_time = time.time()
 request_count = 0
@@ -63,8 +113,6 @@ news_cache_time = {}
 CACHE_DURATION = 1800
 memory_users = {}
 memory_users_lock = threading.Lock()
-local_cache = []
-cache_lock = threading.Lock()
 
 def check_couchdb_connection():
     try:
@@ -83,29 +131,7 @@ try:
 except Exception as e:
     print(f"❌ CouchDB check failed: {e}")
 
-print("🚀 About to start subscriber thread...")
 
-def redis_subscriber():
-    global local_cache
-    if redis_client is None:
-        print("⚠️ Redis unavailable, subscriber thread idle")
-        return
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe('live_prices')
-    print("✅ Subscribed to Redis channel")
-    while True:
-        try:
-            for message in pubsub.listen():
-                if message['type'] == 'message':
-                    data = json.loads(message['data'])
-                    with cache_lock:
-                        local_cache = data
-        except Exception as e:
-            print(f"❌ Redis subscriber error: {e}")
-            time.sleep(2)
-
-if redis_client is not None:
-    threading.Thread(target=redis_subscriber, daemon=True).start()
 
 class User(UserMixin):
     def __init__(self, user_id, username, portfolio=None, password_hash=None):
