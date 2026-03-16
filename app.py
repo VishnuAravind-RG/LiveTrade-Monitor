@@ -19,6 +19,13 @@ import redis
 import yfinance as yf
 from ml_model import predict_next_day
 
+print("🚀 Starting app.py initialization...")
+
+# Add this right after your imports
+print("✅ Imports done")
+
+print("🚀 Starting core initialization...")
+
 app = Flask(__name__)
 app.secret_key = "PSG_TECH_SECRET_KEY"
 
@@ -27,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login_page' 
+login_manager.login_view = 'login_page' #type:ignore
 
 COUCHDB_URL = os.getenv("COUCHDB_URL", "http://admin:password@couchdb:5984/")
 DB_NAME = "stocks"
@@ -58,9 +65,30 @@ def check_couchdb_connection():
         state['couchdb_available'] = False
     return False
 
-check_couchdb_connection()
+# Before Redis connection
+print("⏳ Connecting to Redis...")
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3)
+    redis_client.ping()
+    print("✅ Redis connected")
+except Exception as e:
+    print(f"❌ Redis connection failed: {e}")
+    redis_client = None
+
+# Before CouchDB check
+print("⏳ Checking CouchDB...")
+try:
+    check_couchdb_connection()
+    print(f"✅ CouchDB available: {state['couchdb_available']}")
+except Exception as e:
+    print(f"❌ CouchDB check failed: {e}")
+
+print("🚀 About to start subscriber thread...")
 
 def redis_subscriber():
+    if redis_client is None:
+        print("⚠️ Redis unavailable, subscriber thread idle")
+        return
     pubsub = redis_client.pubsub()
     while True:
         try:
@@ -356,7 +384,7 @@ def get_history(ticker):
         hist = stock.history(period="7d", interval="1h")
         if hist.empty:
             raise Exception("Empty")
-        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist() 
+        dates = hist.index.strftime('%Y-%m-%d %H:%M').tolist() #type:ignore
         prices = hist['Close'].round(2).tolist()
         return jsonify({"ticker": ticker, "dates": dates, "prices": prices})
     except:
