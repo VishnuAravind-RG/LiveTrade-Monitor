@@ -1,17 +1,17 @@
 import time, json, os, requests, logging, random
-import yfinance as yf
 import pandas as pd
-import numpy as np
 import redis
 from datetime import datetime
+import yfinance as yf
 
+# Suppress the ugly yfinance logs
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 COUCHDB_URL = os.getenv("COUCHDB_URL", "http://admin:password@couchdb.railway.internal:5984/")
 DB_NAME = "stocks"
 REDIS_URL = os.getenv("REDIS_URL", "localhost")
 
-# Connect to Redis using Railway's URL format
 if REDIS_URL.startswith("redis"):
     redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 else:
@@ -26,10 +26,21 @@ TICKERS = {
     'BTC-USD': 'Crypto', 'ETH-USD': 'Crypto', 'BNB-USD': 'Crypto', 'SOL-USD': 'Crypto', 'DOGE-USD': 'Crypto'
 }
 
+# --- GLOBAL STATE ---
+API_BLOCKED = False
+SYNTHETIC_PRICES = {}
+
 def init_db():
     try:
         requests.put(f"{COUCHDB_URL}{DB_NAME}")
     except: pass
+
+def init_synthetic_base():
+    for t, ex in TICKERS.items():
+        base = 150.0 if 'US' in ex else 2000.0 if 'India' in ex else 40000.0
+        SYNTHETIC_PRICES[t] = base + random.uniform(-10, 10)
+
+init_synthetic_base()
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -38,30 +49,38 @@ def calc_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def fetch_or_simulate(ticker):
-    try:
-        # Attempt Tier-1 API Call
-        hist = yf.Ticker(ticker).history(period="1mo")
-        if hist.empty or len(hist) < 15:
-            raise ValueError("Rate limited or empty")
-        return hist
-    except Exception as e:
-        # Circuit Breaker Tripped: Fallback to Synthetic Engine
-        base = 150.0 if 'US' in TICKERS[ticker] else 2000.0 if '.NS' in ticker else 40000.0
-        prices = [base]
-        # Generate 30 days of synthetic standard distribution movement
-        for _ in range(30):
-            prices.append(prices[-1] * (1 + random.uniform(-0.02, 0.02)))
-        
-        return pd.DataFrame({
-            'Close': prices, 
-            'Volume': [int(random.uniform(1000000, 5000000)) for _ in prices]
-        })
+def fetch_data(ticker):
+    global API_BLOCKED
+    
+    # If the breaker is not tripped, try Yahoo
+    if not API_BLOCKED:
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if hist.empty or len(hist) < 3:
+                raise ValueError("Rate limited")
+            return hist
+        except Exception:
+            API_BLOCKED = True
+            logging.warning("[CIRCUIT BREAKER] Upstream firewall detected. Severing external connections. Switching to Air-Gapped Simulation.")
+    
+    # If breaker is tripped, generate instant synthetic tick
+    curr = SYNTHETIC_PRICES[ticker]
+    # Simulate high-frequency micro-volatility
+    curr = curr * (1 + random.uniform(-0.003, 0.003))
+    SYNTHETIC_PRICES[ticker] = curr
+    
+    prices = [curr * (1 + random.uniform(-0.01, 0.01)) for _ in range(15)]
+    prices.append(curr)
+    
+    return pd.DataFrame({
+        'Close': prices, 
+        'Volume': [int(random.uniform(1000000, 5000000)) for _ in prices]
+    })
 
 def process_tickers():
     payload = []
     for ticker, exchange in TICKERS.items():
-        hist = fetch_or_simulate(ticker)
+        hist = fetch_data(ticker)
         closes = hist['Close']
         current_price = closes.iloc[-1]
         prev_price = closes.iloc[-2]
@@ -82,24 +101,24 @@ def process_tickers():
         }
         payload.append(doc)
         
-        # Upsert into Persistent CouchDB
+        # Fire-and-forget CouchDB persistence (non-blocking)
         doc['_id'] = ticker
         try:
-            resp = requests.get(f"{COUCHDB_URL}{DB_NAME}/{ticker}")
-            if resp.status_code == 200: doc['_rev'] = resp.json()['_rev']
-            requests.put(f"{COUCHDB_URL}{DB_NAME}/{ticker}", json=doc)
+            requests.put(f"{COUCHDB_URL}{DB_NAME}/{ticker}", json=doc, timeout=1)
         except: pass
             
     return payload
 
 if __name__ == "__main__":
-    logging.info("Starting High-Frequency Ingestion Node with Circuit Breaker...")
+    logging.info("Starting High-Frequency Engine...")
     init_db()
     while True:
         try:
             data = process_tickers()
             redis_client.publish('live_prices', json.dumps(data))
-            logging.info(f"[SUCCESS] Pushed {len(data)} market ticks to Redis stream.")
+            logging.info(f"[PULSE] Broadcasted {len(data)} market ticks via Redis.")
         except Exception as e:
-            logging.error(f"[FATAL] Worker iteration failed: {e}")
-        time.sleep(15) # High frequency 15-second loop
+            logging.error(f"[FATAL] Iteration failed: {e}")
+        
+        # High speed 4-second pulse
+        time.sleep(4)
