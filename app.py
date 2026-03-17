@@ -90,7 +90,7 @@ def redis_subscriber():
     retry_count = 0
     while True:
         try:
-            pubsub = redis_client.pubsub()
+            pubsub = redis_client.pubsub()  #type:ignore
             pubsub.subscribe('live_prices')
             logger.info("Subscribed to Redis channel 'live_prices'")
             for message in pubsub.listen():

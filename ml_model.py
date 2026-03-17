@@ -21,8 +21,8 @@ def _build_and_run_lstm(x_train, y_train, x_test):
     """Isolated function so TF is imported only when actually needed."""
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     try:
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import LSTM, Dense
+        from tensorflow.keras.models import Sequential #type:ignore
+        from tensorflow.keras.layers import LSTM, Dense#type:ignore
     except ImportError as e:
         raise RuntimeError(f"TensorFlow not available: {e}")
 
